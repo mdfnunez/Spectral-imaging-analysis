@@ -1,0 +1,13 @@
+nano ~/Desktop/myprogram.desktop
+
+
+#general structure
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Spectral analysis system
+Comment=Program for the analysis of images from ximea cameras multispectral VIS and NIR, monospectral
+Exec=/home/alonso/Documents/GitHub/Spectral-imaging-analysis/run.sh
+Icon=/home/alonso/Documents/GitHub/Spectral-imaging-analysis/images/spectrum.jpg
+Terminal=true
+Categories=Utility;

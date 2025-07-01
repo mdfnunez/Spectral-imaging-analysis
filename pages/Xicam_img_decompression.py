@@ -5,71 +5,135 @@ import blosc2
 import tifffile
 from datetime import datetime
 import streamlit as st
+import os, re, unicodedata
+from typing import Optional, Dict
 
+import blosc2
+import numpy as np
+import tifffile
 # Importaciones de Tkinter
 import tkinter as tk
 from tkinter import filedialog
+import os, re, unicodedata
+from typing import Optional, Dict
 
-def demosaic(image, mosaic_size):
-    """Convierte una imagen en patrón de mosaico en una imagen demosaiced con canales separados."""
-    rows = image.shape[0] // mosaic_size
-    cols = image.shape[1] // mosaic_size
+import blosc2
+import numpy as np
+import tifffile
+
+
+import os, re, unicodedata
+from typing import Optional, Dict
+
+import blosc2
+import numpy as np
+import tifffile
+
+
+# ────────────────────────────────
+# utilidades
+# ────────────────────────────────
+def demosaic(image: np.ndarray, mosaic_size: int = 4) -> np.ndarray:
+    """Convierte mosaico 2D → cubo (rows, cols, m² bandas)."""
+    rows, cols = image.shape[0] // mosaic_size, image.shape[1] // mosaic_size
     bands = mosaic_size * mosaic_size
-    img_demosaiced = np.zeros((rows, cols, bands), dtype=image.dtype)
-    i_wavelength = 0
-    for i_row in range(mosaic_size):
-        for i_col in range(mosaic_size):
-            img_demosaiced[:, :, i_wavelength] = image[i_row::mosaic_size, i_col::mosaic_size]
-            i_wavelength += 1
-    return img_demosaiced
+    out = np.zeros((rows, cols, bands), dtype=image.dtype)
+    k = 0
+    for r in range(mosaic_size):
+        for c in range(mosaic_size):
+            out[:, :, k] = image[r::mosaic_size, c::mosaic_size]
+            k += 1
+    return out
 
-def save_images_to_tiff(b2nd_path, output_folder, grayscale=False):
-    """Descomprime imágenes de un archivo .b2nd y guarda solo la banda requerida en caso de grayscale."""
-    BLOSC_DATA = blosc2.open(b2nd_path, mode="r")
+
+def _slugify(txt: str) -> str:
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
+    txt = re.sub(r"[^0-9A-Za-z]+", "_", txt).strip("_")
+    return txt[:60]
+
+
+def _parse_log(path: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            if ln.strip():
+                ts, msg = ln.split(" ", 1)
+                m[ts.strip()] = msg.strip()
+    return m
+
+
+# ────────────────────────────────
+# SAVE IMAGES AS MULTI-CHANNEL TIFF
+# ────────────────────────────────
+def save_images_to_tiff(
+    b2nd_path: str,
+    output_folder: str,
+    grayscale: bool = False,
+    mosaic_size: int = 4,
+    band_idx: int = 0,
+    log_path: Optional[str] = None,
+) -> None:
+    """
+    Guarda un único TIFF contiguo con N canales.
+
+    - Cada pixel lleva todos los canales (shape -> (rows, cols, bands)).
+    - Admite uint8/uint12/uint16/float32  y activa BigTIFF si hace falta.
+    """
+    log_map = _parse_log(log_path) if log_path and os.path.isfile(log_path) else {}
+
+    data = blosc2.open(b2nd_path, mode="r")
     os.makedirs(output_folder, exist_ok=True)
+    print(f"Total de cuadros: {data.shape[0]}")
 
-    total_frames = BLOSC_DATA.shape[0]
-    print(f"Total de cuadros en el archivo .b2nd: {total_frames}")
-
-    for i in range(total_frames):
-        image_data = BLOSC_DATA[i][...]
-        print(f"Imagen {i}: forma={image_data.shape}, tipo={image_data.dtype}")
-
-        # Intentar leer time_stamp
+    for i in range(data.shape[0]):
+        img = data[i][...]
         try:
-            time_stamp = BLOSC_DATA.schunk.vlmeta["time_stamp"][i]
-            print(f"Marca de tiempo: {time_stamp}")
+            ts = data.schunk.vlmeta["time_stamp"][i]
         except (AttributeError, KeyError, IndexError):
-            time_stamp = "N-A"
+            ts = "N-A"
 
-        # Procesar la imagen
+        log_msg = log_map.get(ts, "")
+        core = f"{ts}_{_slugify(log_msg)}" if log_msg else ts
+
+        # ── reorganizar bandas ─────────────────────────────
         if grayscale:
-            # Si es 3D, tomar la primera banda
-            if len(image_data.shape) > 2:
-                image_data = image_data[:, :, 0]
-            # Expandir a 3D (1 canal) para TIFF
-            image_data = np.expand_dims(image_data, axis=0)
+            if img.ndim == 3:
+                img = img[:, :, band_idx]
+            # (rows, cols, 1) para que siga siendo contiguo
+            img = img[..., np.newaxis]
         else:
-            # Si es 2D, asumir mosaico
-            if len(image_data.shape) == 2:
-                mosaic_size = 4
-                image_data = demosaic(image_data, mosaic_size)
-            # Si es 3D, mover el eje de bandas al inicio
-            if len(image_data.shape) == 3:
-                image_data = np.transpose(image_data, (2, 0, 1))
+            if img.ndim == 2:                    # mosaico crudo
+                img = demosaic(img, mosaic_size)  # (rows, cols, bands)
+            # si viene (bands, rows, cols) → contiguo
+            if img.ndim == 3 and img.shape[0] < img.shape[-1]:
+                img = np.transpose(img, (1, 2, 0))
 
-        # Normalizar a 16 bits
-        max_value = np.max(image_data)
-        if max_value > 0:
-            image_data = (image_data / max_value * 65535).astype(np.uint16)
+        # ── tipo de datos sin re-escalar ──────────────────
+        if np.issubdtype(img.dtype, np.integer):
+            bits = img.dtype.itemsize * 8
+            if bits <= 16:
+                img = img.astype(np.uint16) << (16 - bits)
+            else:
+                img = np.clip(img, 0, 65535).astype(np.uint16)
+        elif np.issubdtype(img.dtype, np.floating):
+            img = img.astype(np.float32)
         else:
-            image_data = image_data.astype(np.uint16)
+            raise TypeError(f"Tipo no soportado: {img.dtype}")
 
-        outname = os.path.join(output_folder, f"{time_stamp}_imagen_{i}.tif")
-        tifffile.imwrite(outname, image_data, photometric='minisblack')
-        print(f"Guardado: {outname}")
+        # ── escribir TIFF contiguo ────────────────────────
+        out = os.path.join(output_folder, f"{core}_frame_{i}.tif")
+        tifffile.imwrite(
+            out,
+            img,                       # (rows, cols, N)
+            bigtiff=True,
+            photometric="minisblack",  # no RGB ⇒ escala de grises por canal
+            planarconfig="CONTIG",     # <— cada pixel contiene los N valores
+            metadata={"time_stamp": str(ts), "log_msg": log_msg},
+        )
+        print("Guardado:", out)
 
-    print("Descompresión y guardado completados.")
+    print("✅ Descompresión y guardado completados.")
+
 
 def pick_folder_tk():
     """
@@ -173,6 +237,69 @@ def main():
             st.success(f"¡Imágenes guardadas en {output_folder}!")
         else:
             st.error("Por favor, especifica o sube un archivo .b2nd válido.")
+with st.expander("Viewer multiband"):
+    # viewer_multibanda.py
+    import os
+    import streamlit as st
+    import tifffile as tf
+    import numpy as np
+
+
+    st.title("Visor rápido de TIFF multibanda")
+
+    # 1️⃣ ––– Uploader
+    uploaded = st.file_uploader("Sube tu archivo .tif/.tiff", type=["tif", "tiff"])
+
+    if uploaded:
+        # Guarda a disco para que tifffile lo abra
+        tmp_path = "tmp_uploaded.tif"
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded.getbuffer())
+
+        # 2️⃣ ––– Leer TIFF y mostrar metadatos básicos
+        im = tf.imread(tmp_path)
+        st.write(f"**Shape**: {im.shape}   |   **dtype**: {im.dtype}")
+
+        # ¿Bandas en primer o último eje?
+        if im.ndim == 2:  # solo una banda
+            st.image(im, caption="Imagen monobanda")
+            os.remove(tmp_path)
+            st.stop()
+
+        # Reorientar a (rows, cols, bands) para visualizar fácil
+        if im.shape[0] <= 32:             # Heurística: eje 0 = bandas
+            im = np.transpose(im, (1, 2, 0))  # (rows, cols, bands)
+
+        num_bands = im.shape[2]
+        st.write(f"El archivo contiene **{num_bands}** bandas.")
+
+        # 3️⃣ ––– Selector de bandas para RGB
+        default = [0, 1, 2] if num_bands >= 3 else list(range(num_bands))
+        sel = st.multiselect(
+            "Elige 3 bandas para componer un RGB",
+            options=list(range(num_bands)),
+            default=default,
+            help="Si seleccionas menos de 3 se replicarán para completar RGB.",
+        )
+
+        if len(sel) == 0:
+            st.warning("Selecciona al menos una banda.")
+            st.stop()
+
+        # 4️⃣ ––– Construir quick-look RGB
+        while len(sel) < 3:
+            sel.append(sel[-1])  # Rellena con la última elegida
+
+        rgb = im[:, :, sel[:3]].astype(np.float32)
+        rgb -= rgb.min()
+        rgb /= rgb.max() + 1e-9
+        rgb = (rgb * 255).astype(np.uint8)
+
+        st.image(rgb, caption=f"Quick-look RGB – bandas {sel[:3]}")
+
+        # Limpieza
+        os.remove(tmp_path)
+
 
 if __name__ == "__main__":
     main()
