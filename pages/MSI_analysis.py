@@ -18,7 +18,7 @@ import io
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.set_page_config(layout="wide", page_title="Spectral Image Processing App", page_icon=":microscope:")
-tab1,tab2,tab3=st.tabs(['Image processing','Perfusion maps',"ROI analysis"])
+tab1,tab2,tab3,tab4=st.tabs(['Image processing','Perfusion maps',"ROI analysis","Sat determination"])
 with tab1:
     # --- NUEVA FUNCIÓN ROBUSTA ---
     def load_image_stack(folder_path, expected_channels=16, page_main=1):
@@ -273,6 +273,7 @@ with tab2:
 
     # --- EXPANDER: Visualizar mapas de oxigenación ---
     with st.expander("🪸 Generar mapa de oxigenación (HbO2/Hb)"):
+        
         perf_folder = ""
         if st.button("Seleccionar carpeta con archivos .npy de reflectancia"):
             perf_folder = subprocess.check_output([
@@ -414,11 +415,13 @@ with tab2:
         else:
             st.info("Generate an oxygenation map first to see the time series.")
 with tab3:
+    
     # ———————————————————————————————————————————
     # Función para normalizar imagen
     # modo "lineal", "percentile", "std", "log", "custom"
     def normalize_image(img, mode="lineal", custom_min=None, custom_max=None):
         img = np.nan_to_num(img)
+        print(img)
         if mode == "lineal":
             return (img - np.min(img)) / (np.ptp(img) + 1e-6)
         elif mode == "percentile":
@@ -639,3 +642,203 @@ with tab3:
                             ax.grid(True)
                             fig.tight_layout()
                             st.pyplot(fig, use_container_width=True)
+        with st.expander("🔬 Visualizar espectro de absorción y las bandas seleccionadas"):
+            st.markdown("""
+            Este gráfico muestra los coeficientes de absorción relativos (ε) de HbO₂ y Hb 
+            en función de la longitud de onda.  
+            Las líneas verticales indican las bandas seleccionadas actualmente para el cálculo 
+            de saturación, ayudándote a verificar su posición espectral.
+            """)
+
+            # -------------------------------------------------
+            # DataFrame con espectro (compacto solo ejemplo)
+            data = {
+                "Longitud (nm)": [540,542,544,546,548,550,552,554,556,558,560,562,564,566,568,570,572,574,576,578,580,582,584,586,588,590,592,594,596,598,600,602,604,606,608,610,612,614,616,618,620,622,624,626,628,630,632,634,636,638,640,642,644,646,648],
+                "HBO2": [53236,53292,52096,49868,46660,43016,39675.2,36815.2,34476.8,33456,32613.2,32620,33915.6,36495.2,40172,44496,49172,53308,55540,54728,50104,43304,34639.6,26600.4,19763.2,14400.8,10468.4,7678.8,5683.6,4504.4,3200,2664,2128,1789.2,1647.6,1506,1364.4,1222.8,1110,1026,942,858,774,707.6,658.8,610,561.2,512.4,478.8,460.4,442,423.6,405.2,390.4,379.2],
+                "HB":   [46592,48148,49708,51268,52496,53412,54080,54520,54540,54164,53788,52276,50572,48828,46948,45072,43340,41716,40092,38467.6,37020,35676.4,34332.8,32851.6,31075.2,28324.4,25470,22574.8,19800,17058.4,14677.2,13622.4,12567.6,11513.2,10477.6,9443.6,8591.2,7762,7344.8,6927.2,6509.6,6193.2,5906.8,5620,5366.8,5148.8,4930.8,4730.8,4602.4,4473.6,4345.2,4216.8,4088.4,3965.08,3857.6],
+            }
+            df_spec = pd.DataFrame(data)
+            df_spec['eps_HBO2'] = df_spec['HBO2'] / 55000
+            df_spec['eps_HB']   = df_spec['HB']   / 55000
+
+            # -------------------------------------------------
+            # UI para elegir bandas (independiente del otro tab)
+            colb1, colb2 = st.columns(2)
+            with colb1:
+                band1 = st.number_input("Selecciona banda para HbO₂", min_value=0, max_value=15, value=2, step=1, key="band1_spec")
+            with colb2:
+                band2 = st.number_input("Selecciona banda para Hb", min_value=0, max_value=15, value=5, step=1, key="band2_spec")
+
+            # -------------------------------------------------
+            # Marcar λ aproximadas
+            band_mapping = {
+                0:540,1:548,2:554,3:562,4:568,5:576,6:584,7:590,
+                8:596,9:602,10:610,11:616,12:624,13:630,14:638,15:644
+            }
+            λ1 = band_mapping.get(band1, 560)
+            λ2 = band_mapping.get(band2, 580)
+
+            # -------------------------------------------------
+            # Plot
+            fig, ax = plt.subplots(figsize=(8,5))
+            ax.plot(df_spec["Longitud (nm)"], df_spec["eps_HBO2"], label="ε HbO₂", color="crimson")
+            ax.plot(df_spec["Longitud (nm)"], df_spec["eps_HB"], label="ε Hb", color="royalblue")
+            ax.fill_between(df_spec["Longitud (nm)"], df_spec["eps_HBO2"], df_spec["eps_HB"], color='gray', alpha=0.2)
+
+            ax.axvline(λ1, color="crimson", linestyle="--", lw=2, label=f"Banda HbO₂ ~ {λ1} nm")
+            ax.axvline(λ2, color="royalblue", linestyle="--", lw=2, label=f"Banda Hb ~ {λ2} nm")
+
+            ax.set_xlabel("Longitud de onda (nm)")
+            ax.set_ylabel("Coeficiente ε (normalizado)")
+            ax.set_title("Espectro de absorción relativo y bandas seleccionadas")
+            ax.legend()
+            ax.grid(True)
+            st.pyplot(fig)
+                        # ————————————————————————————————————————————————
+            # ————————————————————————————————————————————————
+            # Extraer coeficientes ε para las bandas seleccionadas
+            row1 = df_spec.iloc[df_spec[df_spec["Longitud (nm)"]==λ1].index[0]]
+            row2 = df_spec.iloc[df_spec[df_spec["Longitud (nm)"]==λ2].index[0]]
+
+            eps_hbo2_λ1 = row1['eps_HBO2']
+            eps_hb_λ1   = row1['eps_HB']
+            eps_hbo2_λ2 = row2['eps_HBO2']
+            eps_hb_λ2   = row2['eps_HB']
+
+            # Construir matriz y calcular determinante
+            E = np.array([
+                [eps_hbo2_λ1, eps_hb_λ1],
+                [eps_hbo2_λ2, eps_hb_λ2]
+            ])
+            det = np.linalg.det(E)
+
+            # Mostrar mensaje interpretativo
+            if abs(det) < 0.01:
+                st.warning(f"⚠️ El determinante de la matriz Beer–Lambert con estas bandas es muy bajo ({det:.4f}). Esto puede provocar errores numéricos. Considera elegir bandas más separadas en absorción.")
+            elif abs(det) < 0.05:
+                st.info(f"ℹ️ El determinante es moderado ({det:.4f}). Es aceptable pero revisa la estabilidad.")
+            else:
+                st.success(f"✅ Excelente: el determinante es {det:.4f}. Buena separación espectral para calcular saturación.")
+with tab4:
+    with st.expander("🔬 Calcular StO₂ desde cero con ROI calibrado y espectro"):
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import os
+        from PIL import Image
+        from scipy.ndimage import gaussian_filter
+        from streamlit_image_coordinates import streamlit_image_coordinates
+
+        # ————————————————————————————————————————————————
+        # FUNCIONES UNICAS
+        def load_npy_stack(folder):
+            files = sorted([f for f in os.listdir(folder) if f.endswith('.npy')])
+            return np.stack([np.load(os.path.join(folder, f)) for f in files], axis=0)
+
+        def normalize_percentile(img):
+            p2, p98 = np.nanpercentile(img, (2,98))
+            return np.clip((img - p2) / (p98 - p2 + 1e-6), 0, 1)
+
+        def beer_lambert_solver(stack, band1, band2, invE):
+            ox_stack = []
+            for img in stack:
+                A = -np.log(np.clip(np.stack([img[:,:,band1], img[:,:,band2]], axis=-1), 1e-6, 1))
+                concs = A @ invE.T
+                StO2 = concs[:,:,0] / (concs[:,:,0] + concs[:,:,1] + 1e-6)
+                ox_stack.append(StO2)
+            return np.stack(ox_stack, axis=0)
+        # ————————————————————————————————————————————————
+
+        # Selección de archivos
+        col_w, col_d = st.columns(2)
+        with col_w:
+            if st.button("Seleccionar white_mean.npy"):
+                white_mean_path = subprocess.check_output([
+                    "python3","-c","import tkinter as tk; from tkinter import filedialog; root=tk.Tk(); root.withdraw(); print(filedialog.askopenfilename(filetypes=[('NumPy files', '*.npy')]))"
+                ]).decode().strip()
+        with col_d:
+            if st.button("Seleccionar dark_mean.npy"):
+                dark_mean_path = subprocess.check_output([
+                    "python3","-c","import tkinter as tk; from tkinter import filedialog; root=tk.Tk(); root.withdraw(); print(filedialog.askopenfilename(filetypes=[('NumPy files', '*.npy')]))"
+                ]).decode().strip()
+
+        refl_folder = ""
+        if st.button("Seleccionar carpeta con archivos .npy"):
+            refl_folder = subprocess.check_output([
+                "python3","-c","import tkinter as tk; from tkinter import filedialog; root=tk.Tk(); root.withdraw(); print(filedialog.askdirectory())"
+            ]).decode().strip()
+
+        if white_mean_path and dark_mean_path and refl_folder:
+            white = np.load(white_mean_path)
+            dark  = np.load(dark_mean_path)
+            sigma_xy = max(white.shape[:2]) / 50
+            white_smooth = gaussian_filter(white, sigma=(sigma_xy, sigma_xy, 0))
+            refl_stack = load_npy_stack(refl_folder)
+            stack_refl = []
+            for img in refl_stack:
+                denom = white_smooth - dark
+                denom = np.where(denom <= 1e-6, 1e-6, denom)
+                refl = (img - dark) / denom
+                refl = np.clip(refl,0,1)
+                stack_refl.append(refl)
+            stack_refl = np.stack(stack_refl, axis=0)
+
+            # Espectro y matriz Beer–Lambert
+            df_spec = pd.DataFrame({
+                "λ": [540,542,544,546,548,550,552,554,556,558,560,562,564,566,568,570,572,574,576,578,580,582,584,586,588,590,592,594,596,598,600,602,604,606,608,610,612,614,616,618,620,622,624,626,628,630,632,634,636,638,640,642,644,646,648],
+                "HBO2": [53236,53292,52096,49868,46660,43016,39675.2,36815.2,34476.8,33456,32613.2,32620,33915.6,36495.2,40172,44496,49172,53308,55540,54728,50104,43304,34639.6,26600.4,19763.2,14400.8,10468.4,7678.8,5683.6,4504.4,3200,2664,2128,1789.2,1647.6,1506,1364.4,1222.8,1110,1026,942,858,774,707.6,658.8,610,561.2,512.4,478.8,460.4,442,423.6,405.2,390.4,379.2],
+                "HB":   [46592,48148,49708,51268,52496,53412,54080,54520,54540,54164,53788,52276,50572,48828,46948,45072,43340,41716,40092,38467.6,37020,35676.4,34332.8,32851.6,31075.2,28324.4,25470,22574.8,19800,17058.4,14677.2,13622.4,12567.6,11513.2,10477.6,9443.6,8591.2,7762,7344.8,6927.2,6509.6,6193.2,5906.8,5620,5366.8,5148.8,4930.8,4730.8,4602.4,4473.6,4345.2,4216.8,4088.4,3965.08,3857.6]
+            })
+            df_spec['ε_HBO2'] = df_spec['HBO2'] / 55000
+            df_spec['ε_HB']   = df_spec['HB']   / 55000
+            band_map = {0:540,1:548,2:554,3:562,4:568,5:576,6:584,7:590,8:596,9:602,10:610,11:616,12:624,13:630,14:638,15:644}
+            colb1, colb2 = st.columns(2)
+            with colb1:
+                band1 = st.number_input("Banda para HbO₂", 0,15,2,1)
+            with colb2:
+                band2 = st.number_input("Banda para Hb", 0,15,5,1)
+            λ1,λ2 = band_map[band1], band_map[band2]
+            fig, ax = plt.subplots()
+            ax.plot(df_spec['λ'], df_spec['ε_HBO2'], label="ε HbO₂", color="crimson")
+            ax.plot(df_spec['λ'], df_spec['ε_HB'],   label="ε Hb", color="royalblue")
+            ax.axvline(λ1, color="crimson", linestyle="--", lw=2)
+            ax.axvline(λ2, color="royalblue", linestyle="--", lw=2)
+            ax.fill_between(df_spec['λ'], df_spec['ε_HBO2'], df_spec['ε_HB'], color='gray', alpha=0.2)
+            ax.legend(); ax.grid(); st.pyplot(fig)
+            E = np.array([[df_spec.loc[df_spec['λ']==λ1,'ε_HBO2'].values[0], df_spec.loc[df_spec['λ']==λ1,'ε_HB'].values[0]],
+                          [df_spec.loc[df_spec['λ']==λ2,'ε_HBO2'].values[0], df_spec.loc[df_spec['λ']==λ2,'ε_HB'].values[0]]])
+            det = np.linalg.det(E)
+            if abs(det)<0.01:
+                st.warning(f"⚠️ Determinante muy bajo: {det:.5f}")
+            invE = np.linalg.inv(E)
+
+            # Beer-Lambert
+            ox_time_series = beer_lambert_solver(stack_refl, band1, band2, invE)
+            mean_ox_map = np.nanmean(ox_time_series, axis=0)
+
+            # ROI selector con normalización robusta
+            st.write("Selecciona ROI para calibrar al 98%")
+            vmin,vmax = float(np.nanmin(mean_ox_map)), float(np.nanmax(mean_ox_map))
+            if abs(vmax - vmin) < 1e-5:
+                vmin, vmax = vmin - 0.05, vmax + 0.05  # forzar rango mínimo
+            vm1,vm2 = st.slider("Ajusta rango para visualización", vmin, vmax, (vmin, vmax))
+
+            norm_disp = np.clip((mean_ox_map - vm1) / (vm2 - vm1 + 1e-6),0,1)
+            disp = Image.fromarray((norm_disp*255).astype(np.uint8))
+            click = streamlit_image_coordinates(disp, key="roi_calib_v4")
+            if click:
+                x,y = int(click['x']), int(click['y'])
+                r = st.slider("Radio ROI",3,50,10)
+                yy,xx = np.ogrid[:mean_ox_map.shape[0], :mean_ox_map.shape[1]]
+                mask = (yy-y)**2 + (xx-x)**2 <= r**2
+                mean_roi = np.nanmean(mean_ox_map[mask])
+                st.info(f"Media ROI: {mean_roi:.3f}")
+                if st.button("Calibrar stack a ≈98%"):
+                    ox_calibrated = ox_time_series / mean_roi * 0.98
+                    fig, ax = plt.subplots()
+                    ax.imshow(np.nanmean(ox_calibrated, axis=0), cmap='coolwarm', vmin=0,vmax=1)
+                    ax.set_title("Stack calibrado (media)")
+                    plt.colorbar(ax.images[0], ax=ax)
+                    st.pyplot(fig)
+        else:
+            st.info("Selecciona los archivos y la carpeta para comenzar.")
