@@ -8,7 +8,7 @@ import skimage.exposure
 import time
 import tifffile as tiff
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import simpledialog, Button
 from PIL import Image, ImageTk
 import cv2
 
@@ -24,7 +24,6 @@ def header_agsantos():
         st.image('images/agsantos.png', width=130)
     st.markdown("_______________________")
 header_agsantos()
-
 
 def folder_path_acquisition():
     # ---- Reflectance files (.npy)
@@ -46,11 +45,12 @@ def folder_path_acquisition():
 
                 st.success(f"Loaded reflectance stack: {stack.shape}")
 
-        # Mostrar estado actual siempre
-        folder_path = st.session_state.get('folder_path', None)
-        if folder_path:
-            st.caption(f"✅ Reflectance folder: {folder_path}")
-            st.caption(f"Stack shape: {st.session_state['reflectance_stack'].shape}")
+        # Mostrar estado actual
+        if 'folder_path' in st.session_state:
+            st.success('Reflectance folder uploaded')
+            with col3:
+                st.caption(f"✅ Reflectance folder: {st.session_state['folder_path']}")
+                st.caption(f"Stack shape: {st.session_state['reflectance_stack'].shape}")
 
     # ---- Original images (.tiff)
     with st.sidebar.expander('Add original TIFF images folder'):
@@ -65,110 +65,46 @@ def folder_path_acquisition():
 
                 st.success(f"Loaded original stack: {original_stack.shape}")
 
-        # Mostrar estado actual siempre
+        # Mostrar estado actual
         if 'original_folder_path' in st.session_state:
-            st.caption(f"✅ Original images folder: {st.session_state['original_folder_path']}")
-            st.caption(f"Original stack shape: {st.session_state['original_stack'].shape}")
+            st.success('Original files uploaded')
+            with col3:
+                st.caption(f"✅ Original images folder: {st.session_state['original_folder_path']}")
+                st.caption(f"Original stack shape: {st.session_state['original_stack'].shape}")
 
-    # ---- Processed indices (.npy / .npz)
-    with st.sidebar.expander('Add processed indices folder'):
-        if st.button("Add folder with processed files"):
-            processed_folder_path = easygui.diropenbox('Select folder with processed index files', default="/home/alonso/Desktop/")
-            if processed_folder_path:
-                st.session_state['processed_folder_path'] = processed_folder_path
+    # ---- Processed indices (.npz único)
+    with st.sidebar.expander('Add processed indices (.npz)'):
+        if st.button("Add processed .npz file"):
+            processed_file_path = easygui.fileopenbox(
+                msg="Select a .npz file with processed indices",
+                default="/home/alonso/Desktop/",
+                filetypes=["*.npz"]
+            )
+            if processed_file_path:
+                st.session_state['processed_file_path'] = processed_file_path
 
-                processed_files_list = sorted([f for f in os.listdir(processed_folder_path) if f.endswith((".npy", ".npz"))])
-                st.session_state['processed_files_list'] = processed_files_list
+                data = np.load(processed_file_path)
+                keys = data.files
+                st.session_state['processed_data'] = data
+                st.session_state['processed_keys'] = keys
 
-                if processed_files_list:
-                    first_file = processed_files_list[0]
-                    path_file = os.path.join(processed_folder_path, first_file)
-                    if first_file.endswith(".npz"):
-                        data = np.load(path_file)
-                        keys = data.files
-                        st.caption(f"First .npz contains: {keys}")
-                    else:
-                        data = np.load(path_file)
-                        st.caption(f"First .npy shape: {data.shape}")
+                st.caption(f"Loaded .npz file with keys: {keys}")
 
-                    st.success(f"Loaded processed folder with {len(processed_files_list)} files")
+        # Si ya cargaste el .npz, muestra selectbox para elegir el índice
+        if 'processed_file_path' in st.session_state:
+            st.caption(f"✅ Processed file: {st.session_state['processed_file_path']}")
+            selected_key = st.selectbox("Select index to use from .npz", st.session_state['processed_keys'])
+            # Actualiza stack según selección
+            st.session_state['processed_stack'] = st.session_state['processed_data'][selected_key]
+            st.caption(f"Selected stack shape: {st.session_state['processed_stack'].shape}")
 
-        # Mostrar estado actual siempre
-        if 'processed_folder_path' in st.session_state:
-            st.caption(f"✅ Processed folder: {st.session_state['processed_folder_path']}")
-            st.caption(f"Files: {len(st.session_state.get('processed_files_list', []))} files loaded")
-
-    # Retornar los stacks y paths
+    # ---- Retornar
     reflectance_stack = st.session_state.get('reflectance_stack', None)
     original_stack = st.session_state.get('original_stack', None)
-    processed_files_list = st.session_state.get('processed_files_list', [])
+    processed_stack = st.session_state.get('processed_stack', None)
 
-    return folder_path, reflectance_stack, original_stack, processed_files_list    # ---- Reflectance files (.npy)
-    with st.sidebar.expander('Add reflectance files'):
-        st.caption('Add folder with .npy reflectance files')
-        add_data_button = st.button('Add folder data path')
-        if add_data_button:
-            folder_path = easygui.diropenbox(
-                msg="Select folder with reflectance files (.npy)",
-                default="/home/alonso/Desktop"
-            )
-            st.session_state['folder_path'] = folder_path
+    return reflectance_stack, original_stack, processed_stack
 
-            file_list = sorted([f for f in os.listdir(folder_path) if f.endswith(".npy")])
-            st.caption(f"Found {len(file_list)} .npy files")
-
-            arrays = [np.load(os.path.join(folder_path, f)) for f in file_list]
-            stack = np.stack(arrays, axis=0)
-            st.session_state['reflectance_stack'] = stack
-
-            st.success(f"Reflectance stack shape: {stack.shape}")
-
-        folder_path = st.session_state.get('folder_path', '')
-        stack = st.session_state.get('reflectance_stack', None)
-        if folder_path:
-            st.caption(f"✅ Selected folder: {folder_path}")
-
-    # ---- Original images (.tiff)
-    with st.sidebar.expander('Add original TIFF images folder'):
-        if st.button ("Add folder with .tiff files"):
-            original_folder_path = easygui.diropenbox('Select folder with original .tiff images', default="/home/alonso/Desktop/")
-            st.session_state['original_folder_path'] = original_folder_path
-
-            original_files_list = sorted([f for f in os.listdir(original_folder_path) if f.lower().endswith(('.tiff', '.tif'))])
-            st.caption(f"Found {len(original_files_list)} TIFF files")
-            
-            # Load stack
-            original_stack = np.stack([tiff.imread(os.path.join(original_folder_path, f)) for f in original_files_list], axis=0)
-            st.session_state['original_stack'] = original_stack
-            st.success(f"Original image stack shape: {original_stack.shape}")
-
-    # ---- Processed indices folder (.npy or .npz)
-    with st.sidebar.expander('Add processed indices folder'):
-        if st.button ("Add folder with processed files"):
-            processed_folder_path = easygui.diropenbox('Select folder with processed index files', default="/home/alonso/Desktop/")
-            st.session_state['processed_folder_path'] = processed_folder_path
-
-            processed_files_list = sorted([f for f in os.listdir(processed_folder_path) if f.endswith((".npy", ".npz"))])
-            st.caption(f"Found {len(processed_files_list)} processed files")
-
-            # Example: load first file to show shape
-            first_file = processed_files_list[0]
-            if first_file.endswith(".npz"):
-                data = np.load(os.path.join(processed_folder_path, first_file))
-                keys = data.files
-                st.caption(f"First .npz contains: {keys}")
-            else:
-                data = np.load(os.path.join(processed_folder_path, first_file))
-                st.caption(f"First .npy shape: {data.shape}")
-
-            st.session_state['processed_files_list'] = processed_files_list
-
-    # Always return from session_state
-    original_stack = st.session_state.get('original_stack', None)
-    processed_files_list = st.session_state.get('processed_files_list', [])
-
-    return folder_path, stack, original_stack, processed_files_list
-folder_path, reflectance_stack, original_stack, processed_files_list = folder_path_acquisition()
 
 def band_selection():
     col1, col2, col3 = st.columns(3)
@@ -252,6 +188,7 @@ def band_selection():
                     "the contributions of each molecule. A higher determinant ensures more reliable and stable oxygenation calculations.")
 
             return λ1, λ2, eps_hbo2_λ1, eps_hb_λ1, eps_hbo2_λ2, eps_hb_λ2,E,band1,band2
+#Sidebar selection of band
 λ1, λ2, eps_hbo2_λ1, eps_hb_λ1, eps_hbo2_λ2, eps_hb_λ2,E,band1,band2 = band_selection()
 
 def beer_lambert_sat_calculations():
@@ -320,47 +257,50 @@ def beer_lambert_sat_calculations():
                 )
                 st.success(f"Saved as compressed stack at: {output_file}")
 def viewer_npy():
-    with st.expander('Viewer for StO2 and indexes'):     
-        if st.button('Select file .npz'):
-            index_file_path = easygui.fileopenbox(
-                'Select file with .npz index files',
-                default="/home/alonso/Desktop/"
-            )
-            if index_file_path:
-                st.session_state['index_file_path'] = index_file_path
-                st.session_state['index_data'] = np.load(index_file_path)
-        
-        if 'index_data' in st.session_state:
-            index_data = st.session_state['index_data']
-            st.write(index_data.files)
-        else:
-            st.empty()
+    with st.expander('Viewer for StO2 and indexes'):
+        # Validar que el archivo ya esté cargado
+        if 'processed_data' not in st.session_state or 'processed_keys' not in st.session_state:
+            st.warning("⚠️ No processed .npz file loaded yet. Please add it in the sidebar first.")
             return
 
-    with col3:
-        st.caption('Display')
-        selected_index = st.selectbox('Select type', index_data.files)
-        num_frames = index_data[selected_index].shape[0]
-        st.write(f"Number of frames in selected data: {num_frames}")
-        
-        test = index_data[selected_index]
-        image_selection = st.slider('Select image to display', 0, num_frames - 1, step=1)
+        index_data = st.session_state['processed_data']
+        keys = st.session_state['processed_keys']
 
-        # Threshold si hay tHb
-        mask_toggle = False
-        threshold = 0.0
-        if selected_index == 'StO2' and {'HbO2','Hb'}.issubset(index_data.files):
-            mask_toggle = st.toggle("Mask low tHb pixels", value=True)
-            threshold = st.slider("Threshold for tHb masking", 0.0, 0.1, 0.01, 0.005)
+        # Iniciar el estado persistente
+        if 'viewer_state' not in st.session_state:
+            st.session_state['viewer_state'] = {
+                'selected_index': keys[0],
+                'image_selection': 0,
+                'mask_toggle': True,
+                'threshold': 0.01,
+                'enhancement': "None",
+                'brightness': 1.0,
+                'overlay_alpha': 0.6,
+                'exposure_slider': 1.0
+            }
+        
+        state = st.session_state['viewer_state']
+
+        st.caption('Display')
+        state['selected_index'] = st.selectbox('Select type', keys, index=keys.index(state['selected_index']))
+        test = index_data[state['selected_index']]
+        num_frames = test.shape[0]
+        st.write(f"Number of frames in selected data: {num_frames}")
+
+        state['image_selection'] = st.slider('Select image to display', 0, num_frames - 1, value=state['image_selection'], step=1)
+
+        # Mask si es StO2 con tHb
+        if state['selected_index'] == 'StO2' and {'HbO2','Hb'}.issubset(keys):
+            state['mask_toggle'] = st.toggle("Mask low tHb pixels", value=state['mask_toggle'])
+            state['threshold'] = st.slider("Threshold for tHb masking", 0.0, 0.1, value=state['threshold'], step=0.005)
             HbO2 = index_data['HbO2']
             Hb = index_data['Hb']
             tHb = HbO2 + Hb
-            if mask_toggle:
-                masked = np.where(tHb[image_selection] < threshold, np.nan, test[image_selection])
-            else:
-                masked = test[image_selection]
+            masked = np.where(
+                tHb[state['image_selection']] < state['threshold'], np.nan, test[state['image_selection']]
+            ) if state['mask_toggle'] else test[state['image_selection']]
         else:
-            masked = test[image_selection]
+            masked = test[state['image_selection']]
 
         # Obtener imagen base
         if 'reflectance_stack' not in st.session_state:
@@ -368,240 +308,272 @@ def viewer_npy():
             return
 
         reflectance_stack = st.session_state['reflectance_stack']
-        base_img = reflectance_stack[image_selection, :, :, 0]
+        base_img = reflectance_stack[state['image_selection'], :, :, 0]
 
-        # Sliders para enhancements
-        option = st.radio("Enhancement", ["None", "Brightness", "Auto contrast", "Stretch dynamic range"], horizontal=True)
-        if option == "Brightness":
-            brightness_factor = st.slider("Adjust brightness", 0.1, 5.0, 1.0, 0.1)
-            enhanced_base = np.clip(base_img * brightness_factor, 0, 1)
-        elif option == "Auto contrast":
+        # Enhancements
+        state['enhancement'] = st.radio(
+            "Enhancement", ["None", "Brightness", "Auto contrast", "Stretch dynamic range"],
+            index=["None", "Brightness", "Auto contrast", "Stretch dynamic range"].index(state['enhancement']),
+            horizontal=True
+        )
+
+        if state['enhancement'] == "Brightness":
+            state['brightness'] = st.slider("Adjust brightness", 0.1, 5.0, value=state['brightness'], step=0.1)
+            enhanced_base = np.clip(base_img * state['brightness'], 0, 1)
+        elif state['enhancement'] == "Auto contrast":
             enhanced_base = skimage.exposure.equalize_adapthist(base_img, clip_limit=0.03)
-        elif option == "Stretch dynamic range":
+        elif state['enhancement'] == "Stretch dynamic range":
             enhanced_base = (base_img - base_img.min()) / (base_img.max() - base_img.min() + 1e-8)
         else:
             enhanced_base = base_img
 
-        overlay_alpha = st.slider("Overlay alpha", 0.0, 1.0, 0.6, 0.05)
-        exposure_slider = st.slider("Exposure slider", 0.1, 5.0, 1.0, 0.1)
+        state['overlay_alpha'] = st.slider("Overlay alpha", 0.0, 1.0, value=state['overlay_alpha'], step=0.05)
+        state['exposure_slider'] = st.slider("Exposure slider", 0.1, 5.0, value=state['exposure_slider'], step=0.1)
 
-        # Mostrar imagen actual
+        # Mostrar imagen
         fig, ax = plt.subplots()
         ax.imshow(enhanced_base, cmap='gray')
-        im = ax.imshow(masked, cmap='coolwarm', alpha=overlay_alpha, vmin=0, vmax=1)
+        im = ax.imshow(masked, cmap='coolwarm', alpha=state['overlay_alpha'], vmin=0, vmax=1)
         fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
         ax.axis('off')
-        st.pyplot(fig)
+        with col2:
+            st.pyplot(fig)
 
-        # Export series a folder único con timestamp
+        # Export series
         if st.button("Export current overlay series as PNGs"):
-            output_folder = easygui.diropenbox(
-                'Select output folder to save overlay series',
-                default="/home/alonso/Desktop"
-            )
+            output_folder = easygui.diropenbox('Select output folder to save overlay series', default="/home/alonso/Desktop")
             if output_folder:
-                # Crear subfolder único con fecha-hora
                 timestamp = time.strftime("%Y%m%d-%H%M")
-                new_folder = os.path.join(output_folder, f"{selected_index}_OverlaySeries_{timestamp}")
+                new_folder = os.path.join(output_folder, f"{state['selected_index']}_OverlaySeries_{timestamp}")
                 os.makedirs(new_folder, exist_ok=True)
 
-                # Guardar cada imagen en el subfolder
                 for i in range(num_frames):
                     fig2, ax2 = plt.subplots()
                     ax2.imshow(
-                        np.clip(reflectance_stack[i, :, :, 0] * exposure_slider, 0, 1),
+                        np.clip(reflectance_stack[i, :, :, 0] * state['exposure_slider'], 0, 1),
                         cmap='gray'
                     )
                     overlay_data = np.where(
-                        tHb[i] < threshold, np.nan, test[i]
-                    ) if (mask_toggle and selected_index == 'StO2') else test[i]
+                        tHb[i] < state['threshold'], np.nan, test[i]
+                    ) if (state['mask_toggle'] and state['selected_index'] == 'StO2') else test[i]
 
                     im2 = ax2.imshow(
-                        overlay_data,
-                        cmap='coolwarm',
-                        alpha=overlay_alpha,
-                        vmin=0, vmax=1
+                        overlay_data, cmap='coolwarm', alpha=state['overlay_alpha'], vmin=0, vmax=1
                     )
                     ax2.axis('off')
                     fig2.colorbar(im2, ax=ax2, fraction=0.025, pad=0.01)
                     plt.savefig(
-                        os.path.join(new_folder, f"{selected_index}_overlay_{i}.png"),
+                        os.path.join(new_folder, f"{state['selected_index']}_overlay_{i}.png"),
                         dpi=300, bbox_inches='tight'
                     )
                     plt.close(fig2)
                 
                 st.success(f"✅ Saved overlays in: {new_folder}")
-#tracking and selection of ROIs
+                st.rerun()
 
 
-def run_tracking_on_stacks_in_streamlit():
-    import streamlit as st
-    import tkinter as tk
-    from tkinter import simpledialog
-    from PIL import Image, ImageTk, ImageDraw
-    import numpy as np
-    import cv2
-    import os
-    import time
-    import pandas as pd
-    import easygui
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
+    height, width = processed_stack.shape[1:]
+    data = []
 
-    # ---- Cargar datos desde el session_state
-    original_stack = st.session_state.get('original_stack', None)
-    processed_folder_path = st.session_state.get('processed_folder_path', None)
-    processed_files_list = st.session_state.get('processed_files_list', [])
+    for roi in roi_tracks:
+        name = roi['name']
+        for (frame_id, x, y, w, h) in roi['coords']:
+            y1, y2 = max(0,y), min(y+h,height)
+            x1, x2 = max(0,x), min(x+w,width)
+            roi_data = processed_stack[frame_id][y1:y2, x1:x2]
 
-    if original_stack is None or processed_folder_path is None or not processed_files_list:
-        st.warning("Please load both the original TIFF stack and the processed NPZ files first.")
-        return
-
-    # ---- Cargar índice desde primer npz
-    npz_path = os.path.join(processed_folder_path, processed_files_list[0])
-    npz_data = np.load(npz_path)
-    index_key = "StO2"
-    index_stack = npz_data[index_key]
-
-    # ---- Extraer canal 0
-    if original_stack.ndim != 4 or original_stack.shape[1] != 16:
-        st.error(f"Expected shape (T,16,H,W), got {original_stack.shape}")
-        return
-    first_frame = original_stack[0,0,:,:]
-    H, W = first_frame.shape
-    first_frame_disp = cv2.normalize(first_frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # ---- ROI selector con nombres
-    root = tk.Tk()
-    root.withdraw()
-    win = tk.Toplevel()
-    win.title("Select ROIs - drag and name")
-    scale_factor = 1.5
-    new_H, new_W = int(H*scale_factor), int(W*scale_factor)
-    img = Image.fromarray(first_frame_disp).resize((new_W, new_H))
-    tk_img = ImageTk.PhotoImage(img)
-    canvas = tk.Canvas(win, width=new_W, height=new_H)
-    canvas.pack()
-    canvas_img = canvas.create_image(0, 0, anchor='nw', image=tk_img)
-
-    rect, start = None, (0,0)
-    roi_boxes = []
-
-    def on_press(evt):
-        nonlocal rect, start
-        start = (evt.x, evt.y)
-        rect = canvas.create_rectangle(evt.x, evt.y, evt.x, evt.y, outline='green', width=2)
-
-    def on_drag(evt):
-        canvas.coords(rect, start[0], start[1], evt.x, evt.y)
-
-    def on_release(evt):
-        x0,y0 = start
-        x1,y1 = evt.x, evt.y
-        x,y = min(x0,x1), min(y0,y1)
-        w,h = abs(x1-x0), abs(y1-y0)
-        if w > 5 and h > 5:
-            name = simpledialog.askstring("ROI Name", "Name for this ROI:")
-            if name:
-                roi_boxes.append({'name': name, 'rect':[x,y,w,h]})
-                canvas.create_text(x,y-10, text=name, fill='green', font=('Helvetica',12))
-                canvas.create_rectangle(x, y, x+w, y+h, outline='green', width=2)
-        canvas.delete(rect)
-
-    canvas.bind("<ButtonPress-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
-    tk.Button(win, text="Done", command=win.destroy).pack()
-    root.mainloop()
-
-    # ---- Escalar ROIs de regreso
-    for roi in roi_boxes:
-        x,y,w,h = roi['rect']
-        roi['rect'] = [int(x/scale_factor), int(y/scale_factor), int(w/scale_factor), int(h/scale_factor)]
-
-    if not roi_boxes:
-        st.warning("❌ No ROIs selected.")
-        return
-
-    # ---- Elegir carpeta de salida
-    output_folder = easygui.diropenbox("Select output folder")
-    if not output_folder:
-        st.warning("Cancelled output folder.")
-        return
-
-    # ---- Inicializar tracking
-    lk_params = dict(winSize=(15,15), maxLevel=2,
-                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
-    p0_list = []
-    for roi in roi_boxes:
-        x,y,w,h = roi['rect']
-        pts = cv2.goodFeaturesToTrack(first_frame_disp[y:y+h,x:x+w], maxCorners=20, qualityLevel=0.01, minDistance=2)
-        if pts is not None:
-            pts[:,0,0] += x
-            pts[:,0,1] += y
-        p0_list.append(pts)
-
-    prev_gray = first_frame_disp.copy()
-    timestamp = time.strftime("%Y%m%d-%H%M")
-    out_video_path = os.path.join(output_folder, f"TrackingOverlay_{timestamp}.mp4")
-    out_csv_path = os.path.join(output_folder, f"TrackingData_{timestamp}.csv")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_video_path, fourcc, 5, (W,H))
-    records = []
-
-    progress = st.progress(0, text="Starting tracking...")
-
-    for t in range(1, len(original_stack)):
-        curr_frame = original_stack[t,0,:,:]
-        curr_disp = cv2.normalize(curr_frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        overlay = cv2.cvtColor(curr_disp, cv2.COLOR_GRAY2BGR)
-
-        mask_frame = index_stack[t]
-        mask_norm = cv2.normalize(mask_frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        mask_color = cv2.applyColorMap(mask_norm, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(overlay, 0.7, mask_color, 0.3, 0)
-
-        st.write(f"📌 Frame {t}/{len(original_stack)-1}")
-        for idx, (pts, roi) in enumerate(zip(p0_list, roi_boxes)):
-            x,y,w,h = roi['rect']
-            if pts is not None and len(pts):
-                p1, st_, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_disp, pts, None, **lk_params)
-                good_new = p1[st_==1]
-                good_old = pts[st_==1]
-
-                st.write(f"  ROI {roi['name']}: {len(good_new)} good points")
-                if len(good_new) >= 3:
-                    dx, dy = np.mean(good_new - good_old, axis=0)
-                    x, y = int(np.clip(x+dx,0,W-1)), int(np.clip(y+dy,0,H-1))
-                    roi['rect'][:2] = [x,y]
-                    p0_list[idx] = good_new.reshape(-1,1,2)
-                    mean_val = np.nanmean(mask_frame[y:y+h,x:x+w])
-                    records.append({"Frame": t, "ROI": roi['name'], "MeanStO2": mean_val})
-                    cv2.rectangle(overlay, (x,y), (x+w,y+h), (0,255,0), 2)
-                    cv2.putText(overlay, roi['name'], (x,y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
-                else:
-                    st.write(f"  ⚠️ Not enough points for {roi['name']}")
+            if roi_data.size > 0:
+                mean_val = np.nanmean(roi_data)
+                if np.isnan(mean_val):
+                    mean_val = None
             else:
-                st.write(f"  🚫 No points init for {roi['name']}")
+                mean_val = None
+            data.append({'frame': frame_id, 'roi_name': name, 'mean_value': mean_val})
 
-        out.write(overlay)
-        prev_gray = curr_disp.copy()
-        progress.progress(t/len(original_stack), text=f"Processing frame {t}/{len(original_stack)}")
+    df = pd.DataFrame(data)
+    return df
 
-    out.release()
-    progress.progress(1.0, text="Done ✅")
+def tracking_roi_selector(original_stack, processed_stack, scale=3, output_video='tracking_output.avi'):
+    with st.expander('ROI tracker'):
+        if st.button("Select ROIs & Track"):
+            rois_local = []
 
-    # ---- Guardar CSV
-    df = pd.DataFrame(records)
-    df.to_csv(out_csv_path, index=False)
-    st.success(f"✅ Video & CSV saved at {output_folder}")
-    with open(out_video_path, "rb") as f:
-        st.download_button("Download tracking video", f, file_name=os.path.basename(out_video_path))
+            def on_toggle():
+                nonlocal use_global_percentile
+                use_global_percentile = not use_global_percentile
+                toggle_btn.config(text=f"Use global percentiles: {use_global_percentile}")
+
+            use_global_percentile = True
+            global_p1, global_p99 = np.nanpercentile(processed_stack, (1,99))
+
+            img0 = original_stack[0][0]
+            p1, p99 = np.percentile(img0, (1, 99))
+            img0 = np.clip(img0, p1, p99)
+            img0 = (255 * (img0 - p1) / (p99 - p1 + 1e-5)).astype(np.uint8)
+
+            H, W = img0.shape
+            pil_img = Image.fromarray(img0).resize((W*scale, H*scale))
+            new_W, new_H = pil_img.size
+
+            root = tk.Tk()
+            root.title("Select ROIs on Image 0")
+
+            canvas = tk.Canvas(root, width=new_W, height=new_H)
+            canvas.pack()
+            tk_img = ImageTk.PhotoImage(pil_img)
+            canvas.create_image(0, 0, anchor='nw', image=tk_img)
+
+            rect = None
+            start = (0, 0)
+
+            def on_press(evt):
+                nonlocal rect, start
+                start = (evt.x, evt.y)
+                rect = canvas.create_rectangle(evt.x, evt.y, evt.x, evt.y, outline='green', width=2)
+
+            def on_drag(evt):
+                canvas.coords(rect, start[0], start[1], evt.x, evt.y)
+
+            def on_release(evt):
+                x0, y0 = start
+                x1, y1 = evt.x, evt.y
+                x, y = min(x0, x1), min(y0, y1)
+                w, h = abs(x1 - x0), abs(y1 - y0)
+                if w == 0 or h == 0:
+                    return
+                x, y, w, h = x//scale, y//scale, w//scale, h//scale
+                name = simpledialog.askstring("ROI Name", "Name for this ROI:")
+                if not name:
+                    return
+                rois_local.append({'name': name, 'rect': (x, y, w, h)})
+
+            canvas.bind('<ButtonPress-1>', on_press)
+            canvas.bind('<B1-Motion>', on_drag)
+            canvas.bind('<ButtonRelease-1>', on_release)
+
+            toggle_btn = tk.Button(root, text=f"Use global percentiles: {use_global_percentile}", command=on_toggle)
+            toggle_btn.pack(pady=5)
+
+            finish_btn = tk.Button(root, text="Finish Selection & Start Tracking", command=root.destroy)
+            finish_btn.pack(pady=10)
+            root.mainloop()
+
+            # --- Tracking
+            height, width = original_stack[0][0].shape
+            roi_tracks = []
+
+            for roi in rois_local:
+                name = roi['name']
+                x, y, w, h = roi['rect']
+                template = original_stack[0][0, y:y+h, x:x+w].astype(np.float32)
+                p1, p99 = np.percentile(template, (1,99))
+                template = np.clip(template, p1, p99)
+                template = (255 * (template - p1) / (p99 - p1 + 1e-5)).astype(np.uint8)
+
+                coords_per_frame = []
+                for i, frame in enumerate(original_stack):
+                    img = frame[0].astype(np.float32)
+                    p1, p99 = np.percentile(img, (1,99))
+                    img_norm = np.clip(img, p1, p99)
+                    img_norm = (255 * (img_norm - p1) / (p99 - p1 + 1e-5)).astype(np.uint8)
+
+                    res = cv2.matchTemplate(img_norm, template, cv2.TM_CCOEFF_NORMED)
+                    _, _, _, max_loc = cv2.minMaxLoc(res)
+                    x_new, y_new = max_loc
+                    coords_per_frame.append( (i, x_new, y_new, w, h) )
+
+                roi_tracks.append({'name': name, 'coords': coords_per_frame})
+
+            # --- Generar video
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            video_name = f"{'global' if use_global_percentile else 'fixed'}_{output_video}"
+            out = cv2.VideoWriter(video_name, fourcc, 10, (width, height))
+
+            for i in range(len(original_stack)):
+                img = original_stack[i][0].astype(np.float32)
+                p1, p99 = np.percentile(img, (1,99))
+                img_norm = np.clip(img, p1, p99)
+                img_norm = (255 * (img_norm - p1) / (p99 - p1 + 1e-5)).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
+
+                mask = processed_stack[i].astype(np.float32)
+                if use_global_percentile:
+                    mask_norm = np.clip(mask, global_p1, global_p99)
+                    mask_norm = (255 * (mask_norm - global_p1) / (global_p99 - global_p1 + 1e-5)).astype(np.uint8)
+                else:
+                    mask_norm = np.clip(mask, 0, 1)
+                    mask_norm = (255 * mask_norm).astype(np.uint8)
+
+                color_mask = cv2.applyColorMap(mask_norm, cv2.COLORMAP_JET)
+                frame_bgr = cv2.addWeighted(frame_bgr, 0.6, color_mask, 0.4, 0)
+
+                for roi in roi_tracks:
+                    _, x, y, w, h = roi['coords'][i]
+                    cv2.rectangle(frame_bgr, (x, y), (x+w, y+h), (0,255,0), 2)
+
+                out.write(frame_bgr)
+
+            out.release()
+            st.success(f"✅ Tracking done. Video saved as: {video_name}")
+
+            # --- Guardar
+            st.session_state["roi_tracks"] = roi_tracks
+            st.session_state["video_file"] = video_name
+
+            # --- Calcular y exportar mean automáticamente
+            df = compute_mean_in_tracked_rois(processed_stack, roi_tracks)
+            st.write(df)
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download CSV of mean ROI values", csv, "mean_roi_values.csv", "text/csv")
+
+            # --- Descargar video
+            with open(video_name, 'rb') as f:
+                st.download_button("📥 Download tracking video", f, file_name=os.path.basename(video_name), mime="video/avi")
+
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
+    height, width = processed_stack.shape[1:]
+    data = []
+
+    for roi in roi_tracks:
+        name = roi['name']
+        for (frame_id, x, y, w, h) in roi['coords']:
+            y1, y2 = max(0,y), min(y+h,height)
+            x1, x2 = max(0,x), min(x+w,width)
+            roi_data = processed_stack[frame_id][y1:y2, x1:x2]
+
+            # Debug para auditoría
+            print(f"Frame {frame_id}, ROI {name}: bounds=({y1}:{y2}, {x1}:{x2}), shape={roi_data.shape}")
+            if roi_data.size > 0:
+                print(f"ROI data sample: {roi_data.flatten()[:5]}")
+
+            # Calcula mean solo si tiene datos válidos
+            if roi_data.size > 0:
+                mean_val = np.nanmean(roi_data)
+                if np.isnan(mean_val):
+                    mean_val = None
+            else:
+                mean_val = None
+            data.append({'frame': frame_id, 'roi_name': name, 'mean_value': mean_val})
+
+    df = pd.DataFrame(data)
+    return df
 
 
-col1,col2,col3=st.columns([1,0.5,1])
+
+col1,col2,col3=st.columns([1,1,0.5])
+with col3:
+    st.write('Log')
+reflectance_stack,original_stack,processed_stack=folder_path_acquisition()
+with col2:
+    st.caption('Viewers')
 with col1:
     beer_lambert_sat_calculations()
-with col2:
     viewer_npy()
+    tracking_roi_selector(original_stack,processed_stack)
 
-            
 
+    
+
+ 
+  
