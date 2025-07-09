@@ -1,2 +1,0 @@
-Instal streamlit file browser from
-$ pip install streamlit-file-browser
