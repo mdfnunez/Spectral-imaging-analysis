@@ -1,4 +1,4 @@
-import getpass
+import easygui
 import numpy as np
 import blosc2
 import tifffile
@@ -6,13 +6,9 @@ from datetime import datetime
 import streamlit as st
 import os, re, unicodedata
 from typing import Optional, Dict
-import tkinter as tk
-from tkinter import filedialog
+import pandas as pd
 
-col1,col2,col3=st.columns(3)
-# ────────────────────────────────
-# utilidades
-# ────────────────────────────────
+
 def demosaic(image: np.ndarray, mosaic_size: int = 4) -> np.ndarray:
     """Convierte mosaico 2D → cubo (rows, cols, m² bandas)."""
     rows, cols = image.shape[0] // mosaic_size, image.shape[1] // mosaic_size
@@ -24,14 +20,10 @@ def demosaic(image: np.ndarray, mosaic_size: int = 4) -> np.ndarray:
             out[:, :, k] = image[r::mosaic_size, c::mosaic_size]
             k += 1
     return out
-
-
 def _slugify(txt: str) -> str:
     txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
     txt = re.sub(r"[^0-9A-Za-z]+", "_", txt).strip("_")
     return txt[:60]
-
-
 def _parse_log(path: str) -> Dict[str, str]:
     m: Dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -40,11 +32,6 @@ def _parse_log(path: str) -> Dict[str, str]:
                 ts, msg = ln.split(" ", 1)
                 m[ts.strip()] = msg.strip()
     return m
-
-
-# ────────────────────────────────
-# SAVE IMAGES AS MULTI-CHANNEL TIFF
-# ────────────────────────────────
 def save_images_to_tiff(
     b2nd_path: str,
     output_folder: str,
@@ -52,6 +39,7 @@ def save_images_to_tiff(
     mosaic_size: int = 4,
     band_idx: int = 0,
     log_path: Optional[str] = None,
+    log_list: Optional[list] = None,
 ) -> None:
     """
     Guarda un único TIFF contiguo con N canales.
@@ -59,11 +47,16 @@ def save_images_to_tiff(
     - Cada pixel lleva todos los canales (shape -> (rows, cols, bands)).
     - Admite uint8/uint12/uint16/float32  y activa BigTIFF si hace falta.
     """
+    def log(msg):
+        print(msg)
+        if log_list is not None:
+            log_list.append(msg)
+
     log_map = _parse_log(log_path) if log_path and os.path.isfile(log_path) else {}
 
     data = blosc2.open(b2nd_path, mode="r")
     os.makedirs(output_folder, exist_ok=True)
-    print(f"Total de cuadros: {data.shape[0]}")
+    log(f"Total de cuadros: {data.shape[0]}")
 
     for i in range(data.shape[0]):
         img = data[i][...]
@@ -79,78 +72,61 @@ def save_images_to_tiff(
         if grayscale:
             if img.ndim == 3:
                 img = img[:, :, band_idx]
-            # (rows, cols, 1) para que siga siendo contiguo
             img = img[..., np.newaxis]
         else:
-            if img.ndim == 2:                    # mosaico crudo
-                img = demosaic(img, mosaic_size)  # (rows, cols, bands)
-            # si viene (bands, rows, cols) → contiguo
+            if img.ndim == 2:
+                img = demosaic(img, mosaic_size)
+            # Asegura que img sea (rows, cols, bands)
             if img.ndim == 3 and img.shape[0] < img.shape[-1]:
                 img = np.transpose(img, (1, 2, 0))
 
-        # ── tipo de datos sin re-escalar ──────────────────
-        if np.issubdtype(img.dtype, np.integer):
-            bits = img.dtype.itemsize * 8
-            if bits <= 16:
-                img = img.astype(np.uint16) << (16 - bits)
-            else:
-                img = np.clip(img, 0, 65535).astype(np.uint16)
-        elif np.issubdtype(img.dtype, np.floating):
-            img = img.astype(np.float32)
-        else:
-            raise TypeError(f"Tipo no soportado: {img.dtype}")
+        log(f"[DEBUG] Antes de normalizar: shape={img.shape}, dtype={img.dtype}, min={img.min()}, max={img.max()}")
 
-        # ── escribir TIFF contiguo ────────────────────────
+        # ── normalizar a 16 bits ──────────────────────────
+        max_value = np.max(img)
+        if max_value > 0:
+            img = (img.astype(np.float32) / max_value * 65535).astype(np.uint16)
+        else:
+            img = img.astype(np.uint16)
+
+        # ── reorganizar a (canal, fila, columna) ──────────
+        if img.ndim == 3:
+            img = np.transpose(img, (2, 0, 1))
+        elif img.ndim == 2:
+            img = img[np.newaxis, :, :]
+
+        log(f"[DEBUG] Guardando {core}_frame_{i}.tif: shape={img.shape}, dtype={img.dtype}, min={img.min()}, max={img.max()}")
+
         out = os.path.join(output_folder, f"{core}_frame_{i}.tif")
         tifffile.imwrite(
             out,
-            img,                       # (rows, cols, N)
-            bigtiff=True,
-            photometric="minisblack",  # no RGB ⇒ escala de grises por canal
-            planarconfig="CONTIG",     # <— cada pixel contiene los N valores
-            metadata={"time_stamp": str(ts), "log_msg": log_msg},
+            img,
+            photometric="minisblack"
         )
-        print("Guardado:", out)
-
-    print("✅ Descompresión y guardado completados.")
-
-
-def pick_folder_tk():
-    
-    # Intentamos /media/<usuario> primero
-    username = getpass.getuser()
-    media_path = os.path.join("/media", username)  # /media/tu_usuario
-
-    # Si aún no existe, fallback al HOME
-    if not os.path.exists(media_path):
-        media_path = os.path.expanduser("~")
-
-    root = tk.Tk()
-    root.withdraw()  # Oculta la ventana principal
-    folder_path = filedialog.askdirectory(
-        initialdir=media_path,
-        title="Selecciona la carpeta de salida (discos externos suelen estar en /media)"
-    )
-    root.destroy()
-    return folder_path
-
+        log(f"Guardado: {out}")
 def main():
-    with col1:
-            st.subheader("Decompression of .b2nd files")
-            option = st.selectbox("Proveer el archivo .b2nd", ["Subir archivo", "Ruta manual"])
-            if option == "Subir archivo":
-                uploaded_file = st.file_uploader("Sube tu archivo .b2nd", type=["b2nd"])
-                b2nd_path = None
-            else:
-                b2nd_path = st.text_input("Ruta al archivo .b2nd")
+    st.sidebar.subheader('Decompression of .b2nd files')
+    with st.sidebar.expander("Upload .b2nd files"):
+        option = st.selectbox("Proveer el archivo .b2nd", ["Subir archivo", "Ruta manual"])
+        if option == "Subir archivo":
+            uploaded_file = st.file_uploader("Sube tu archivo .b2nd", type=["b2nd"])
+            b2nd_path = None
+
+        else:
+            button_b2nd = st.button("select folder for .b2nd")
+            if button_b2nd:
+                b2nd_path = easygui.fileopenbox(
+                    "Selecciona el archivo .b2nd",
+                    default="*.b2nd",
+                    filetypes=["*.b2nd"]
+                )
                 uploaded_file = None
-                if b2nd_path and not os.path.isfile(b2nd_path):
-                    st.error("¡La ruta especificada no es válida!")
-    with col2:
-        st.caption('Select the folder to save the files')
+            if b2nd_path and not os.path.isfile(b2nd_path):
+                st.error("¡La ruta especificada no es válida!")
+        st.caption('Output folder')
         # 2) Botón para seleccionar carpeta con Tkinter (mostrando discos externos)
         if st.button("Output folder"):
-            selected_folder = pick_folder_tk()
+            selected_folder = easygui.diropenbox("Select output folder",default="/home/alonso/Desktop/")
             if selected_folder:
                 st.session_state["selected_folder"] = selected_folder
                 st.success(f"Carpeta seleccionada: {selected_folder}")
@@ -193,279 +169,215 @@ def main():
                 os.makedirs(output_folder, exist_ok=True)
 
                 with st.spinner("Descomprimiendo..."):
-                    save_images_to_tiff(b2nd_path, output_folder, grayscale=grayscale)
+                    # Pasa el log decomp_log para logging en tiempo real
+                    st.session_state["decomp_log"].clear()
+                    save_images_to_tiff(b2nd_path, output_folder, grayscale=grayscale, log_list=st.session_state["decomp_log"])
 
                 st.success(f"¡Imágenes guardadas en {output_folder}!")
             else:
                 st.error("Por favor, especifica o sube un archivo .b2nd válido.")
-    with col3:   
-        with st.expander('Viewer for .tiff files'):
-            st.caption("Visor rápido de TIFF multibanda")
+col1, col2 = st.columns(2)
+with col1:
+    main()
+    # Log para Decompression en un DataFrame
+    if "decomp_log" not in st.session_state:
+        st.session_state["decomp_log"] = []
+    st.markdown("**Decompression Log:**")
+    decomp_log_df = pd.DataFrame({"Log": st.session_state["decomp_log"]})
+    st.dataframe(decomp_log_df, height=200, hide_index=True)
 
-            # 1️⃣ ––– Uploader
-            uploaded = st.file_uploader("Sube tu archivo .tif/.tiff", type=["tif", "tiff"])
+# ─── UTILIDADES DE REFLECTANCIA ───────────────────────────────────────────────
 
-            if uploaded:
-                # Guarda a disco para que tifffile lo abra
-                tmp_path = "tmp_uploaded.tif"
-                with open(tmp_path, "wb") as f:
-                    f.write(uploaded.getbuffer())
-
-                # 2️⃣ ––– Leer TIFF y mostrar metadatos básicos
-                im = tf.imread(tmp_path)
-                st.write(f"**Shape**: {im.shape}   |   **dtype**: {im.dtype}")
-
-                # ¿Bandas en primer o último eje?
-                if im.ndim == 2:  # solo una banda
-                    st.image(im, caption="Imagen monobanda")
-                    os.remove(tmp_path)
-                    st.stop()
-
-                # Reorientar a (rows, cols, bands) para visualizar fácil
-                if im.shape[0] <= 32:             # Heurística: eje 0 = bandas
-                    im = np.transpose(im, (1, 2, 0))  # (rows, cols, bands)
-
-                num_bands = im.shape[2]
-                st.write(f"El archivo contiene **{num_bands}** bandas.")
-
-                # 3️⃣ ––– Selector de bandas para RGB
-                default = [0, 1, 2] if num_bands >= 3 else list(range(num_bands))
-                sel = st.multiselect(
-                    "Elige 3 bandas para componer un RGB",
-                    options=list(range(num_bands)),
-                    default=default,
-                    help="Si seleccionas menos de 3 se replicarán para completar RGB.",
-                )
-
-                if len(sel) == 0:
-                    st.warning("Selecciona al menos una banda.")
-                    st.stop()
-
-                # 4️⃣ ––– Construir quick-look RGB
-                while len(sel) < 3:
-                    sel.append(sel[-1])  # Rellena con la última elegida
-
-                rgb = im[:, :, sel[:3]].astype(np.float32)
-                rgb -= rgb.min()
-                rgb /= rgb.max() + 1e-9
-                rgb = (rgb * 255).astype(np.uint8)
-
-                st.image(rgb, caption=f"Quick-look RGB – bandas {sel[:3]}")
-
-                # Limpieza
-                os.remove(tmp_path)
-main()
-
- # --- NUEVA FUNCIÓN ROBUSTA ---
-def load_image_stack(folder_path, expected_channels=16, page_main=1):
-    """
-    Devuelve [(fname, img)] donde img es (H,W,bandas).
-    page_main=1 ⇒ primero intenta la página 1 (cubo completo)
-    y si no existe usa la 0 (compatibilidad con TIFF antiguos).
-    """
-
-    imgs=[]
-    for fname in sorted(f for f in os.listdir(folder_path)
-                        if f.lower().endswith(('.tif','.tiff'))):
+def load_image_stack_safe(folder, expected_channels=16):
+    imgs = []
+    for fname in sorted(os.listdir(folder)):
+        if fname.startswith("._"):
+            continue
+        if not fname.lower().endswith((".tif", ".tiff")):
+            continue
+        path = os.path.join(folder, fname)
         try:
-            with tifffile.TiffFile(os.path.join(folder_path,fname)) as tif:
-                key = page_main if page_main < len(tif.pages) else 0
-                arr = tif.asarray(key=key)
-            if arr.ndim==3 and arr.shape[0]==expected_channels:
-                arr=np.moveaxis(arr,0,-1)          # (H,W,C)
-            if arr.ndim==3 and arr.shape[-1]==expected_channels:
-                imgs.append((fname,arr.astype(np.float32)))
-            else:
-                st.warning(f"{fname}: canales={arr.shape[-1]} (omitido)")
+            with tifffile.TiffFile(path) as tif:
+                if tif.series and tif.series[0].shape[0] == expected_channels:
+                    arr = tif.series[0].asarray()
+                else:
+                    arr = tif.asarray(key=0)
+            if arr.ndim == 3 and arr.shape[0] == expected_channels:
+                arr = np.moveaxis(arr, 0, -1)
+            if not (arr.ndim == 3 and arr.shape[-1] == expected_channels):
+                continue
+            imgs.append((fname, arr.astype(np.float32)))
         except Exception as e:
-            st.warning(f"No se pudo cargar {fname}: {e}")
+            continue
     return imgs
-# --- FIN NUEVA FUNCIÓN ---
 
-with st.expander("Select images", expanded=False):
-    col1, col2 = st.columns(2)
+def calcular_y_guardar_reflectancia(dark_f, white_f, data_f):
+    # iniciar log limpio
+    st.session_state["reflect_log"] = []
+    def log(msg, error=False):
+        p = "❌ ERROR:" if error else "🔄"
+        st.session_state["reflect_log"].append(f"{p} {msg}")
 
-    with col1:
-        if st.button("Select folder with DARK images"):
-            dark_ref_folder = subprocess.check_output([
-                "python3", "-c",
-                "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); print(filedialog.askdirectory(initialdir='/home/alonso/Desktop'))"
-            ]).decode("utf-8").strip()
-            st.session_state['dark_ref_folder'] = dark_ref_folder
-            st.success("Dark reference folder selected correctly.")
+    log("1️⃣ Iniciando cálculo de reflectancia")
 
-    with col2:
-        if st.button("Select folder with WHITE images"):
-            white_ref_folder = subprocess.check_output([
-                "python3", "-c",
-                "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); print(filedialog.askdirectory(initialdir='/home/alonso/Desktop'))"
-            ]).decode("utf-8").strip()
-            st.session_state['white_ref_folder'] = white_ref_folder
-            st.success("White reference folder selected correctly.")
+    # Carga stacks y chequeo
+    try:
+        white_imgs = [img for _,img in load_image_stack_safe(white_f)]
+        log(f"WHITE: {len(white_imgs)} imágenes cargadas")
+        dark_imgs  = [img for _,img in load_image_stack_safe(dark_f)]
+        log(f"DARK : {len(dark_imgs)} imágenes cargadas")
+        data_list  = load_image_stack_safe(data_f)
+        log(f"DATA : {len(data_list)} imágenes encontradas")
+    except Exception as e:
+        log(str(e), error=True)
+        return None
 
-    dark_ref_folder = st.session_state.get('dark_ref_folder', '')
-    white_ref_folder = st.session_state.get('white_ref_folder', '')
+    if not white_imgs or not dark_imgs or not data_list:
+        log("Faltan imágenes en alguna carpeta", error=True)
+        return None
 
+    # medias
+    wm = np.median(np.stack(white_imgs,0), axis=0)
+    dm = np.median(np.stack(dark_imgs, 0), axis=0)
+    log(f"White mean {wm.shape}, Dark mean {dm.shape}")
 
+    # suavizado
+    sigma = max(wm.shape[:2])/50
+    ws = gaussian_filter(wm, sigma=(sigma,sigma,0))
+    log(f"White smooth {ws.shape}")
 
-    if dark_ref_folder:
-        with col1:
-            st.caption(f"Dark reference folder: {dark_ref_folder}")
-
-    if white_ref_folder:
-        with col2:
-            st.caption(f"White reference folder: {white_ref_folder}")
-
-with st.expander("🔍 White and Dark Analysis", expanded=False):
-    run_analysis = st.button("Iniciar análisis de white/dark")
-
-    if run_analysis:
-        if os.path.isdir(white_ref_folder) and os.path.isdir(dark_ref_folder):
-            white_stack = [img for _, img in load_image_stack(white_ref_folder)]
-            dark_stack = [img for _, img in load_image_stack(dark_ref_folder)]
-
-            if white_stack and dark_stack:
-                # --- BLOQUE NUEVO: mediana robusta y sigma adaptativo ---
-                white_stack = np.stack(white_stack,0).astype(np.float32)
-                dark_stack  = np.stack(dark_stack ,0).astype(np.float32)
-
-                white_mean = np.median(white_stack,axis=0)
-                dark_mean  = np.median(dark_stack ,axis=0)
-
-                sigma_xy = max(white_mean.shape[:2]) / 50  # ~2 % del FOV
-                white_smooth = gaussian_filter(white_mean, sigma=(sigma_xy, sigma_xy, 0))
-                # --- FIN BLOQUE NUEVO ---
-
-                ch = st.slider("Selecciona canal a visualizar (0–15)", 0, 15, 0)
-
-                st.write("Visualización de canal seleccionado:")
-                col_w, col_d = st.columns(2)
-
-                with col_w:
-                    fig1, ax1 = plt.subplots()
-                    im1 = ax1.imshow(white_mean[:, :, ch], cmap='gray')
-                    ax1.set_title(f"White Median - Canal {ch}")
-                    plt.colorbar(im1, ax=ax1)
-                    st.pyplot(fig1)
-
-                with col_d:
-                    fig2, ax2 = plt.subplots()
-                    im2 = ax2.imshow(dark_mean[:, :, ch], cmap='gray')
-                    ax2.set_title(f"Dark Median - Canal {ch}")
-                    plt.colorbar(im2, ax=ax2)
-                    st.pyplot(fig2)
-
-                # Guardar los archivos mean.npy en las carpetas de origen
-                white_mean_path = os.path.join(white_ref_folder, "white_mean.npy")
-                dark_mean_path = os.path.join(dark_ref_folder, "dark_mean.npy")
-                np.save(white_mean_path, white_mean)
-                np.save(dark_mean_path, dark_mean)
-                st.success(f"Promedios guardados como:\n- '{white_mean_path}'\n- '{dark_mean_path}'")
-            else:
-                st.error("Error al cargar las imágenes de referencia.")
-        else:
-            st.warning("Selecciona carpetas válidas para referencias white y dark.")
-
-with st.expander("🧪 Procesar reflectancia de múltiples carpetas"):
-    st.markdown("Selecciona las carpetas que contienen las imágenes por condición. Se generará la reflectancia y se guardará en subcarpetas.")
-    if st.button("Seleccionar carpetas para convertir a reflectancia"):
-        folders = subprocess.check_output([
-            "python3", "-c",
-            "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); import pathlib; paths = filedialog.askdirectory(mustexist=True, initialdir='/home/alonso/Desktop'); print(paths)"
-        ]).decode("utf-8").strip().split(":::")
-        st.session_state['reflectance_folders'] = folders
-
-    # Seleccionar archivos white_mean.npy y dark_mean.npy con tkinter
-    col_white, col_dark = st.columns(2)
-    with col_white:
-        if st.button("Seleccionar archivo white_mean.npy"):
-            white_mean_path = subprocess.check_output([
-                "python3", "-c",
-                "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); print(filedialog.askopenfilename(filetypes=[('NumPy files', '*.npy')], initialdir='/home/alonso/Desktop'))"
-            ]).decode("utf-8").strip()
-            st.session_state['white_mean_path'] = white_mean_path
-            st.success("Archivo white_mean.npy seleccionado correctamente.")
-
-    with col_dark:
-        if st.button("Seleccionar archivo dark_mean.npy"):
-            dark_mean_path = subprocess.check_output([
-                "python3", "-c",
-                "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); print(filedialog.askopenfilename(filetypes=[('NumPy files', '*.npy')], initialdir='/home/alonso/Desktop'))"
-            ]).decode("utf-8").strip()
-            st.session_state['dark_mean_path'] = dark_mean_path
-            st.success("Archivo dark_mean.npy seleccionado correctamente.")
-
-    white_mean_path = st.session_state.get('white_mean_path', '')
-    dark_mean_path = st.session_state.get('dark_mean_path', '')
-
-    if white_mean_path:
-        with col_white:
-            st.caption(f"white_mean.npy: {white_mean_path}")
-    if dark_mean_path:
-        with col_dark:
-            st.caption(f"dark_mean.npy: {dark_mean_path}")
-
-    folders = st.session_state.get('reflectance_folders', [])
-    # Controlar el flujo según las selecciones hechas
-    if folders and white_mean_path and dark_mean_path:
+    # reflectancias
+    refls = {}
+    for fn, img in data_list:
         try:
-            white = np.load(white_mean_path)
-            dark = np.load(dark_mean_path)
-            sigma_xy = max(white.shape[:2]) / 50  # ~2 % del FOV
-            white_smooth = gaussian_filter(white, sigma=(sigma_xy, sigma_xy, 0))
-
-            for folder in folders:
-                st.write(f"Procesando carpeta: {folder}")
-                images = load_image_stack(folder)
-                output_dir = os.path.join(folder, "reflectance")
-                os.makedirs(output_dir, exist_ok=True)
-
-                for fname, img_array in images:
-                    # --- BLOQUE NUEVO: reflectancia robusta ---
-                    epsilon = 1e-6
-                    denom  = white_smooth - dark
-                    bad    = denom <= epsilon
-                    denom  = np.where(bad, epsilon, denom)
-
-                    refl = (img_array - dark) / denom
-                    refl[bad] = np.nan
-                    refl = np.clip(refl,0,1).astype(np.float32)
-
-                    out_path = os.path.join(
-                        output_dir,
-                        fname.replace(".tif","_refl.npy").replace(".tiff","_refl.npy")
-                    )
-                    np.save(out_path, refl)
-                    # --- FIN BLOQUE NUEVO ---
-                st.success(f"Carpeta '{folder}' procesada y guardada en '{output_dir}'")
+            denom = ws - dm
+            eps = 1e-6
+            mask = denom <= eps
+            denom[mask] = eps
+            r = (img - dm)/denom
+            r[mask] = np.nan
+            r = np.clip(r,0,1).astype(np.float32)
+            refls[os.path.splitext(fn)[0]] = r
+            log(f"{fn}: reflect {r.shape}")
         except Exception as e:
-            st.error(f"Error al cargar los archivos de referencia: {e}")
-    elif folders or white_mean_path or dark_mean_path:
-        # Mostrar advertencias específicas según lo que falte
-        if not folders:
-            st.warning("Debes seleccionar al menos una carpeta de imágenes para procesar.")
-        if not white_mean_path:
-            st.warning("Debes seleccionar el archivo white_mean.npy.")
-        if not dark_mean_path:
-            st.warning("Debes seleccionar el archivo dark_mean.npy.")
-def sidebar_files_upload():
-    with st.sidebar.expander('Upload files'):
-        st.caption('Add image files')
-        dark=st.file_uploader('Upload dark image averaged in npy format',key="dark", type="npy")
-        if dark is not None:
-            dark=np.load(dark)
-        white=st.file_uploader('Upload white image average in npy format',key="white",type="npy")
-        if white is not None:
-            white=np.load(white)
-        folder_path_acquisition=st.button('Add folder data path')
-        if folder_path_acquisition:
-            data = easygui.diropenbox(msg="Select folder with reflectance files (.npy)",default="/home/alonso/Desktop")
+            log(f"Error {fn}: {e}", error=True)
 
-        else:
-            data=None
+    if not refls:
+        log("No se calculó ninguna reflectancia", error=True)
+        return None
 
-        return dark,white,data 
+    out = os.path.join(data_f, "reflectance")
+    os.makedirs(out, exist_ok=True)
+    npz_path = os.path.join(out, "reflectance.npz")
+    try:
+        np.savez_compressed(npz_path, **refls)
+        log(f"✅ Guardado {npz_path}")
+    except Exception as e:
+        log(f"Error al guardar NPZ: {e}", error=True)
+        return None
 
-    ### Ends block for uploading files
-#Acquire global variables from uploaders
-dark, white, data = sidebar_files_upload()
+    return npz_path
+
+def write_log(msg, error=False):
+    prefix = "❌ ERROR:" if error else "🔄"
+    if "reflect_log" not in st.session_state:
+        st.session_state["reflect_log"] = []
+    st.session_state["reflect_log"].append(f"{prefix} {msg}")
+    df = pd.DataFrame({"Log": st.session_state["reflect_log"]})
+    log_area.dataframe(df, height=200, hide_index=True)
+
+def main_reflectance():
+    with col2:
+        st.subheader("Reflectance Calculation")
+        # asegurar estado
+        for key in ("dark_folder","white_folder","data_folder"):
+            if key not in st.session_state:
+                st.session_state[key] = ""
+
+        # selección de carpetas
+        if st.button("Select DARK folder"):
+            d = easygui.diropenbox("Selecciona DARK", default="/home/alonso/Desktop/")
+            if d: st.session_state.dark_folder = d
+        if st.button("Select WHITE folder"):
+            w = easygui.diropenbox("Selecciona WHITE", default="/home/alonso/Desktop/")
+            if w: st.session_state.white_folder = w
+        if st.button("Select DATA folder"):
+            D = easygui.diropenbox("Selecciona DATA", default="/home/alonso/Desktop/")
+            if D: st.session_state.data_folder = D
+
+        # área de log
+        global log_area
+        log_area = st.empty()
+        if "reflect_log" not in st.session_state:
+            st.session_state["reflect_log"] = []
+        df = pd.DataFrame({"Log": st.session_state["reflect_log"]})
+        log_area.dataframe(df, height=200, hide_index=True)
+
+        # ejecutar cálculo
+        if st.button("Start Reflectance"):
+            d = st.session_state.dark_folder
+            w = st.session_state.white_folder
+            D = st.session_state.data_folder
+            st.session_state["reflect_log"] = []
+            if not (d and w and D):
+                write_log("Faltan carpetas DARK, WHITE o DATA", error=True)
+                st.error("❌ Selecciona DARK, WHITE y DATA primero")
+                return
+
+            write_log("Cargando imágenes DARK...")
+            dark_imgs = [img for _, img in load_image_stack_safe(d)]
+            write_log(f"Imágenes DARK cargadas: {len(dark_imgs)}")
+            write_log("Cargando imágenes WHITE...")
+            white_imgs = [img for _, img in load_image_stack_safe(w)]
+            write_log(f"Imágenes WHITE cargadas: {len(white_imgs)}")
+            write_log("Cargando imágenes DATA...")
+            data_list = load_image_stack_safe(D)
+            write_log(f"Imágenes DATA cargadas: {len(data_list)}")
+
+            if not dark_imgs or not white_imgs or not data_list:
+                write_log("Faltan imágenes en alguna carpeta", error=True)
+                st.error("Faltan imágenes en alguna carpeta")
+                return
+
+            try:
+                white_mean = np.median(np.stack(white_imgs, 0), axis=0)
+                dark_mean = np.median(np.stack(dark_imgs, 0), axis=0)
+                write_log(f"White mean: {white_mean.shape}, Dark mean: {dark_mean.shape}")
+
+                sigma = max(white_mean.shape[:2]) / 50
+                from scipy.ndimage import gaussian_filter
+                white_smooth = gaussian_filter(white_mean, sigma=(sigma, sigma, 0))
+                write_log(f"White smooth: {white_smooth.shape}")
+
+                refls = {}
+                for fname, img in data_list:
+                    try:
+                        denom = white_smooth - dark_mean
+                        eps = 1e-6
+                        mask = denom <= eps
+                        denom[mask] = eps
+                        r = (img - dark_mean) / denom
+                        r[mask] = np.nan
+                        r = np.clip(r, 0, 1).astype(np.float32)
+                        refls[os.path.splitext(fname)[0]] = r
+                        write_log(f"{fname}: reflectancia {r.shape}")
+                    except Exception as e:
+                        write_log(f"Error {fname}: {e}", error=True)
+
+                if not refls:
+                    write_log("No se calculó ninguna reflectancia", error=True)
+                    st.error("No se calculó ninguna reflectancia")
+                    return
+
+                out = os.path.join(D, "reflectance")
+                os.makedirs(out, exist_ok=True)
+                npz_path = os.path.join(out, "reflectance.npz")
+                np.savez_compressed(npz_path, **refls)
+                write_log(f"✅ Guardado {npz_path}")
+                st.success(f"¡Reflectancia lista! NPZ en:\n`{npz_path}`")
+            except Exception as e:
+                write_log(f"Error en el cálculo: {e}", error=True)
+                st.error(f"Error en el cálculo: {e}")
+
+# ─── EJECUCIÓN ────────────────────────────────────────────────────────────────
+main_reflectance()
