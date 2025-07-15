@@ -56,7 +56,7 @@ def folder_path_acquisition():
         if st.button("Add folder with .tiff files"):
             folder = easygui.diropenbox(
                 msg='Select folder with original .tiff images',
-                default="~/"
+                default="/home/alonso/Desktop"
             )
             if folder:
                 imgs = []
@@ -87,6 +87,7 @@ def folder_path_acquisition():
             if p:
                 data = np.load(p, allow_pickle=True)
                 st.session_state['processed_data'] = data
+                st.session_state['processed_files_names']=data["file_names"].tolist()
                 st.session_state['processed_keys'] = list(data.files)
                 st.session_state['processed_file_path'] = p
                 st.success(f"✅ Processed keys: {st.session_state['processed_keys']}")
@@ -106,7 +107,8 @@ def folder_path_acquisition():
     return (
         st.session_state.get('reflectance_stack', None),
         st.session_state.get('original_stack', None),
-        st.session_state.get('processed_stack', None)
+        st.session_state.get('processed_stack', None),
+        st.session_state.get("processed_files_names",None)
     )
 
 
@@ -553,40 +555,46 @@ def tracking_roi_selector(original_stack, processed_stack, scale=3, output_video
 def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
     height, width = processed_stack.shape[1:]
     data = []
+    file_names = p_files_names
 
     for roi in roi_tracks:
         name = roi['name']
         for (frame_id, x, y, w, h) in roi['coords']:
-            y1, y2 = max(0,y), min(y+h,height)
-            x1, x2 = max(0,x), min(x+w,width)
+            y1, y2 = max(0, y), min(y + h, height)
+            x1, x2 = max(0, x), min(x + w, width)
             roi_data = processed_stack[frame_id][y1:y2, x1:x2]
 
-            # Debug para auditoría
-            print(f"Frame {frame_id}, ROI {name}: bounds=({y1}:{y2}, {x1}:{x2}), shape={roi_data.shape}")
+            # Debug
+            print(f"Frame {frame_id} ({file_names[frame_id]}), ROI {name}: bounds=({y1}:{y2}, {x1}:{x2}), shape={roi_data.shape}")
             if roi_data.size > 0:
                 print(f"ROI data sample: {roi_data.flatten()[:5]}")
 
-            # Calcula mean solo si tiene datos válidos
             if roi_data.size > 0:
                 mean_val = np.nanmean(roi_data)
                 if np.isnan(mean_val):
                     mean_val = None
             else:
                 mean_val = None
-            data.append({'frame': frame_id, 'roi_name': name, 'mean_value': mean_val})
+
+            data.append({'frame': file_names[frame_id], 'roi_name': name, 'mean_value': mean_val})
 
     df = pd.DataFrame(data)
-    return df
+
+    # 🚀 Pivot para que cada ROI sea columna
+    df_wide = df.pivot(index='frame', columns='roi_name', values='mean_value').reset_index()
+    return df_wide
 
 
 
 col1,col2,col3=st.columns([1,1,0.5])
-with col3:
-    st.write('Log')
-reflectance_stack,original_stack,processed_stack=folder_path_acquisition()
+
+reflectance_stack,original_stack,processed_stack,p_files_names=folder_path_acquisition()
 with col2:
     st.caption('Viewers')
 with col1:
     beer_lambert_sat_calculations()
     viewer_npy()
     tracking_roi_selector(original_stack,processed_stack)
+with col3:
+    st.write('Log')
+    st.write(p_files_names)
