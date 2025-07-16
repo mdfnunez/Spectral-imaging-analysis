@@ -6,8 +6,8 @@ nano ~/Desktop/myprogram.desktop
 Version=1.0
 Type=Application
 Name=Spectral analysis system
-Comment=Program for the analysis of images from ximea cameras multispectral VIS and NIR, monospectral
-Exec=/home/alonso/Documents/GitHub/Spectral-imaging-analysis/run.sh
+Comment=Program for multispectral XIMEA image analysis
+Exec=bash -c "cd /home/alonso/Documents/GitHub/Spectral-imaging-analysis && ./run.sh && sleep 2 && /usr/bin/google-chrome --app=http://localhost:8501"
 Icon=/home/alonso/Documents/GitHub/Spectral-imaging-analysis/images/spectrum.jpg
-Terminal=true
+Terminal=false
 Categories=Utility;

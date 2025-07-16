@@ -236,7 +236,7 @@ def calcular_y_guardar_reflectancia(dark_f, white_f, data_f):
         log("Faltan imágenes en alguna carpeta", error=True)
         return None
 
-    # medias
+    # medians
     wm = np.median(np.stack(white_imgs,0), axis=0)
     dm = np.median(np.stack(dark_imgs, 0), axis=0)
     log(f"White mean {wm.shape}, Dark mean {dm.shape}")

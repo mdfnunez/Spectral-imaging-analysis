@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import simpledialog, Button
 from PIL import Image, ImageTk
 import cv2
+from bisect import bisect_right
 
 
 st.set_page_config(layout="wide")
@@ -100,6 +101,16 @@ def folder_path_acquisition():
             )
             st.session_state['processed_stack'] = st.session_state['processed_data'][sel]
             st.caption(f"Selected `{sel}` shape: {st.session_state['processed_stack'].shape}")
+        uploaded_log=st.sidebar.file_uploader('Upload log.txt',type=".txt")
+        log_map = {}
+        if uploaded_log is not None:
+            log_content = uploaded_log.getvalue().decode("utf-8")
+            for ln in log_content.splitlines():
+                if ln.strip():
+                    ts, msg = ln.split(" ", 1)
+                    log_map[ts.strip()] = msg.strip()
+            st.success("✅ Log file processed successfully.")
+
 
     # ———————————————————————————————
     # 4) Devuelve los tres stacks
@@ -108,7 +119,8 @@ def folder_path_acquisition():
         st.session_state.get('reflectance_stack', None),
         st.session_state.get('original_stack', None),
         st.session_state.get('processed_stack', None),
-        st.session_state.get("processed_files_names",None)
+        st.session_state.get("processed_files_names",None),
+        log_map
     )
 
 
@@ -392,29 +404,6 @@ def viewer_npy():
                 st.success(f"✅ Saved overlays in: {new_folder}")
                 st.rerun()
 
-
-def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
-    height, width = processed_stack.shape[1:]
-    data = []
-
-    for roi in roi_tracks:
-        name = roi['name']
-        for (frame_id, x, y, w, h) in roi['coords']:
-            y1, y2 = max(0,y), min(y+h,height)
-            x1, x2 = max(0,x), min(x+w,width)
-            roi_data = processed_stack[frame_id][y1:y2, x1:x2]
-
-            if roi_data.size > 0:
-                mean_val = np.nanmean(roi_data)
-                if np.isnan(mean_val):
-                    mean_val = None
-            else:
-                mean_val = None
-            data.append({'frame': frame_id, 'roi_name': name, 'mean_value': mean_val})
-
-    df = pd.DataFrame(data)
-    return df
-
 def tracking_roi_selector(original_stack, processed_stack, scale=3, output_video='tracking_output.avi'):
     with st.expander('ROI tracker'):
         if st.button("Select ROIs & Track"):
@@ -543,7 +532,7 @@ def tracking_roi_selector(original_stack, processed_stack, scale=3, output_video
             st.session_state["video_file"] = video_name
 
             # --- Calcular y exportar mean automáticamente
-            df = compute_mean_in_tracked_rois(processed_stack, roi_tracks)
+            df = compute_mean_in_tracked_rois(processed_stack, roi_tracks,log_map)
             st.write(df)
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download CSV of mean ROI values", csv, "mean_roi_values.csv", "text/csv")
@@ -552,10 +541,13 @@ def tracking_roi_selector(original_stack, processed_stack, scale=3, output_video
             with open(video_name, 'rb') as f:
                 st.download_button("📥 Download tracking video", f, file_name=os.path.basename(video_name), mime="video/avi")
 
-def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
+
+
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks, log_map):
     height, width = processed_stack.shape[1:]
     data = []
     file_names = p_files_names
+    sorted_ts = sorted(log_map.keys())
 
     for roi in roi_tracks:
         name = roi['name']
@@ -564,11 +556,6 @@ def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
             x1, x2 = max(0, x), min(x + w, width)
             roi_data = processed_stack[frame_id][y1:y2, x1:x2]
 
-            # Debug
-            print(f"Frame {frame_id} ({file_names[frame_id]}), ROI {name}: bounds=({y1}:{y2}, {x1}:{x2}), shape={roi_data.shape}")
-            if roi_data.size > 0:
-                print(f"ROI data sample: {roi_data.flatten()[:5]}")
-
             if roi_data.size > 0:
                 mean_val = np.nanmean(roi_data)
                 if np.isnan(mean_val):
@@ -576,19 +563,34 @@ def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
             else:
                 mean_val = None
 
-            data.append({'frame': file_names[frame_id], 'roi_name': name, 'mean_value': mean_val})
+            ts = file_names[frame_id].split("_imagen")[0]
+
+            # buscar evento más reciente <= ts
+            idx = bisect_right(sorted_ts, ts) - 1
+            if idx >= 0:
+                nearest_ts = sorted_ts[idx]
+                log_text = log_map[nearest_ts]
+            else:
+                log_text = ""
+
+            data.append({
+                'frame': file_names[frame_id],
+                'log_event': log_text,
+                'roi_name': name,
+                'mean_value': mean_val
+            })
 
     df = pd.DataFrame(data)
-
-    # 🚀 Pivot para que cada ROI sea columna
-    df_wide = df.pivot(index='frame', columns='roi_name', values='mean_value').reset_index()
+    df_wide = df.pivot(index=['frame', 'log_event'], columns='roi_name', values='mean_value').reset_index()
     return df_wide
+
+
 
 
 
 col1,col2,col3=st.columns([1,1,0.5])
 
-reflectance_stack,original_stack,processed_stack,p_files_names=folder_path_acquisition()
+reflectance_stack,original_stack,processed_stack,p_files_names,log_map=folder_path_acquisition()
 with col2:
     st.caption('Viewers')
 with col1:
@@ -597,4 +599,11 @@ with col1:
     tracking_roi_selector(original_stack,processed_stack)
 with col3:
     st.write('Log')
-    st.write(p_files_names)
+    try:
+        df_files = pd.DataFrame({"frame names": p_files_names})
+        st.dataframe(df_files, use_container_width=True, hide_index=True)
+        df_log = pd.DataFrame(list(log_map.items()), columns=["Timestamp", "log_event"])
+        st.dataframe(df_log, use_container_width=True,hide_index=True)
+    except:
+        st.info('Nothing to show')
+

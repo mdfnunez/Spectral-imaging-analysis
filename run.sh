@@ -1,5 +1,6 @@
-#! /bin/bash
+#!/bin/bash
 source venv/bin/activate
 
-streamlit run app.py
+pkill -f streamlit
 
+streamlit run app.py --server.headless true --server.port 8501 &
