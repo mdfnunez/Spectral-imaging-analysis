@@ -1,0 +1,12 @@
+Actualmente los archivos de reflectancia cuentan con la key "file_names_reflectance"
+
+import numpy as np
+file="/home/alonso/Documents/GitHub/Spectral-imaging-analysis/StO2_data.npz" 
+files=np.load(file)
+files_reflectance=files["file_names_reflectance"]
+print(files_reflectance)
+
+#esto da la lista de los archivos:
+['20241019_16-17-50-805_imagen_0' '20241019_16-17-54-090_imagen_1'
+ '20241019_16-17-57-376_imagen_2' ... '20241019_18-13-13-806_imagen_2107'
+ '20241019_18-13-17-091_imagen_2108' '20241019_18-13-20-378_imagen_2109']

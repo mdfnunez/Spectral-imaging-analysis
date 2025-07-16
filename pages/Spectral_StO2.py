@@ -45,6 +45,9 @@ def folder_path_acquisition():
                 # stack de todas las claves del .npz
                 reflectance_list = [data[key] for key in sorted(data.files)]
                 reflectance_stack = np.stack(reflectance_list, axis=0)
+                file_names_reflectance = sorted(data.files) 
+                st.session_state["file_names_reflectance"]=file_names_reflectance # lista ordenada de los nombres
+
                 
                 st.session_state['reflectance_stack'] = reflectance_stack
                 st.session_state['reflectance_npz_path'] = path
@@ -120,6 +123,7 @@ def folder_path_acquisition():
         st.session_state.get('original_stack', None),
         st.session_state.get('processed_stack', None),
         st.session_state.get("processed_files_names",None),
+        st.session_state.get("file_names_reflectance",None),
         log_map
     )
 
@@ -212,8 +216,14 @@ def band_selection():
 def beer_lambert_sat_calculations():
     with st.expander('Beer-Lambert StO2 calculations (DEBUG MODE)'):
         refl = st.session_state.get('reflectance_stack')
+        file_names = st.session_state.get('file_names_reflectance')  # ⬅️ obtener nombres
+
         if refl is None:
             st.warning('❌ No reflectance data loaded. Carga primero el .npz.')
+            return
+
+        if file_names is None:
+            st.warning("❌ No se encontraron los nombres de los archivos (file_names_reflectance).")
             return
 
         st.write(f"Reflectance shape: {refl.shape}")
@@ -248,9 +258,18 @@ def beer_lambert_sat_calculations():
         if st.button('Save Beer–Lambert .npz'):
             out = easygui.filesavebox(msg="Guardar .npz", default="~/StO2_data.npz")
             if out:
-                np.savez_compressed(out, StO2=StO2, HbO2=HbO2, Hb=Hb, tHb=HbO2+Hb, DeltaHb=HbO2-Hb)
+                np.savez_compressed(
+                    out,
+                    StO2=StO2,
+                    HbO2=HbO2,
+                    Hb=Hb,
+                    tHb=HbO2 + Hb,
+                    DeltaHb=HbO2 - Hb,
+                    file_names_reflectance=file_names  # ⬅️ agregamos los nombres
+                )
                 size = os.path.getsize(out)
                 st.success(f"✅ Saved {out} ({size/1e3:.1f} kB)")
+
 
 def viewer_npy():
     with st.expander('Viewer for StO2 and indexes'):
@@ -590,7 +609,7 @@ def compute_mean_in_tracked_rois(processed_stack, roi_tracks, log_map):
 
 col1,col2,col3=st.columns([1,1,0.5])
 
-reflectance_stack,original_stack,processed_stack,p_files_names,log_map=folder_path_acquisition()
+reflectance_stack,original_stack,processed_stack,p_files_names,log_map,file_names_reflectance=folder_path_acquisition()
 with col2:
     st.caption('Viewers')
 with col1:
