@@ -52,6 +52,7 @@ def folder_path_acquisition():
                 st.session_state['reflectance_stack'] = reflectance_stack
                 st.session_state['reflectance_npz_path'] = path
                 st.success(f"✅ Reflectance cargada con shape: {reflectance_stack.shape}")
+                st.dataframe(file_names_reflectance)
 
     # ———————————————————————————————
     # 2) Original TIFF folder
@@ -619,10 +620,14 @@ with col1:
 with col3:
     st.write('Log')
     try:
+        df_names_reflectance=pd.DataFrame({'Reflectance frame names':file_names_reflectance})
+        st.dataframe(df_names_reflectance,hide_index=True)
         df_files = pd.DataFrame({"frame names": p_files_names})
         st.dataframe(df_files, use_container_width=True, hide_index=True)
         df_log = pd.DataFrame(list(log_map.items()), columns=["Timestamp", "log_event"])
         st.dataframe(df_log, use_container_width=True,hide_index=True)
+
     except:
         st.info('Nothing to show')
 
+st.write(file_names_reflectance)
