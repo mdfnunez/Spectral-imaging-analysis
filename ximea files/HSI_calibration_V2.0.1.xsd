@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="utf-8"?>
+<xs:schema attributeFormDefault="unqualified" elementFormDefault="qualified" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+	<!-- xiSpec2 camera series calibration file format, XIMEA -->
+	<!-- V2.0.1, 2021-04-12 -->
+	
+	<!-- calibration file objects -->
+	<xs:element name="sensor_calibration" type="Sensor_Calibration"/>
+	
+	<xs:complexType name="Sensor_Calibration">
+		<xs:sequence>
+			<xs:element name="sensor_info" type="Sensor_Info"/>
+			<xs:element name="filter_info" type="Filter_Info"/>
+			<xs:element name="system_info" type="System_Info"/>
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="3" />
+		<xs:attribute name="sensor_id" type="xs:string" use="required" />
+		<xs:attribute name="created" type="xs:dateTime" use="required" />
+		<xs:attribute name="modified" type="xs:dateTime" use="required" />
+		<xs:attribute name="software" type="xs:string" use="required" />
+		<xs:attribute name="software_version" type="xs:string" use="required" />
+	</xs:complexType>
+
+	
+	<!-- Enumerations -->
+	<xs:simpleType name="Filter_Layout_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="MOSAIC"/>
+			<xs:enumeration value="TILED"/>
+			<xs:enumeration value="WEDGE"/>
+		</xs:restriction>
+	</xs:simpleType>
+	
+	<xs:simpleType name="Peak_Shape_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="Fabry-Perot"/>
+			<xs:enumeration value="Gaussian"/>
+			<xs:enumeration value="Lorentzian"/>
+		</xs:restriction>
+	</xs:simpleType>
+	
+	<xs:simpleType name="Optical_Component_Type_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="shortpass_filter"/>
+			<xs:enumeration value="longpass_filter"/>
+			<xs:enumeration value="bandpass_filter"/>
+			<xs:enumeration value="notch_filter"/>
+			<xs:enumeration value="linear_polarizer"/>
+			<xs:enumeration value="circular_polarizer"/>
+			<xs:enumeration value="source"/>
+		</xs:restriction>
+	</xs:simpleType>
+	
+	<xs:simpleType name="Correction_Matrix_Algorithm_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="m0"/>
+			<xs:enumeration value="m1"/>
+		</xs:restriction>
+	</xs:simpleType>
+	
+	<xs:simpleType name="Correction_Matrix_Type_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="irradiance"/>
+			<xs:enumeration value="reflectance"/>
+		</xs:restriction>
+	</xs:simpleType>
+
+	<xs:simpleType name="Sensor_Info_Type_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="CMV2K" />
+			<xs:enumeration value="CDL640" />
+		</xs:restriction>
+	</xs:simpleType>
+	
+	<xs:simpleType name="Gain_Mode_Type_Enum">
+		<xs:restriction base="xs:string">
+			<xs:enumeration value="low" />
+			<xs:enumeration value="medium" />
+			<xs:enumeration value="high" />
+		</xs:restriction>
+	</xs:simpleType>
+	
+	
+	<!-- double value argument lists -->
+	<xs:simpleType name="doubleList">
+		<xs:list itemType="xs:double"/>
+	</xs:simpleType>
+	
+	<xs:complexType name="Value_List_Double">
+		<xs:simpleContent>
+			<xs:extension base="xs:string">
+				<xs:attribute name="nr_elements" type="xs:int" use="required"/>
+				<xs:attribute name="values" type="doubleList" />
+			</xs:extension>
+		</xs:simpleContent>
+	</xs:complexType>
+
+	
+
+	<!-- main object sensor_info-->
+	<xs:complexType name="Sensor_Info">
+		<xs:sequence>
+			<xs:element name="width_px" type="xs:int" />
+			<xs:element name="height_px" type="xs:int" />
+			<xs:element name="pixel_pitch_um" type="xs:double" />
+			<xs:element name="bit_depth" type="xs:int" />
+			<xs:element name="overall_gain" type="xs:double"  />
+			<xs:element name="analog_gain" type="xs:double" minOccurs="0" />
+			<xs:element name="digital_gain" type="xs:double" minOccurs="0" />
+			<xs:element name="full_well_capacity_e" type="xs:int" minOccurs="0" />
+			<xs:element name="gain_mode" type="Gain_Mode_Type_Enum" minOccurs="0" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="2" />
+		<xs:attribute name="sensor_type" type="Sensor_Info_Type_Enum" use="required" />
+	</xs:complexType>
+
+
+	<!-- main object filter_info-->
+	<xs:complexType name="Filter_Info">
+		<xs:sequence>
+			<xs:element name="calibration_info" type="Calibration_Info"/>
+			<xs:element name="filter_zones" type="Filter_Zones"/>
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="1" />
+	</xs:complexType>
+
+	<xs:complexType name="Calibration_Info">
+		<xs:sequence>
+			<xs:element name="sample_points_nm" type="Value_List_Double"/>
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="5" />
+	</xs:complexType>
+	
+	<xs:complexType name="Filter_Zones">
+		<xs:sequence>
+			<xs:element name="filter_zone" type="Filter_Zone" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Filter_Zone">
+		<xs:sequence>
+			<xs:element name="filter_area" type="Filter_Area" />
+			<xs:element name="pattern_width" type="xs:int" />
+			<xs:element name="pattern_height" type="xs:int" />
+			<xs:element name="filter_width" type="xs:int" />
+			<xs:element name="filter_height" type="xs:int" />
+			<xs:element name="spectral_range_start_nm" type="xs:double" />
+			<xs:element name="spectral_range_end_nm" type="xs:double" />
+			<xs:element name="bands" type="Bands" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="3" />
+		<xs:attribute name="layout" type="Filter_Layout_Enum" use="required" />
+		<xs:attribute name="index" type="xs:int" use="required" />
+	</xs:complexType>
+
+	<xs:complexType name="Filter_Area">
+		<xs:sequence>
+			<xs:element name="offset_x" type="xs:int" />
+			<xs:element name="offset_y" type="xs:int" />
+			<xs:element name="width" type="xs:int" />
+			<xs:element name="height" type="xs:int" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="0"/>
+	</xs:complexType>
+	
+	<xs:complexType name="Bands">
+		<xs:sequence>
+			<xs:element name="band" type="Band" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Band">
+		<xs:sequence>
+			<xs:element name="peaks" type="Peaks"/>
+			<xs:element name="response" type="Value_List_Double"/>
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="4" />
+		<xs:attribute name="index" type="xs:int" use="required" />
+		<xs:attribute name="selected" type="xs:boolean" use="required" />
+	</xs:complexType>
+
+	<xs:complexType name="Peaks">
+		<xs:sequence>
+			<xs:element name="peak" type="Peak" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Peak">
+		<xs:sequence>
+			<xs:element name="wavelength_nm" type="xs:double" />
+			<xs:element name="fwhm_nm" type="xs:double" />
+			<xs:element name="QE" type="xs:double" />
+			<xs:element name="contribution" type="xs:double" />
+			<xs:element name="fit_error" type="xs:double" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="2" />
+		<xs:attribute name="order" type="xs:int" use="required" />
+		<xs:attribute name="shape" type="Peak_Shape_Enum" use="required" />
+	</xs:complexType>
+	
+	
+	<!-- main object system_info-->
+	<xs:complexType name="System_Info">
+		<xs:sequence>
+			<xs:element name="optical_components" type="Optical_Components" minOccurs="0"/>
+			<xs:element name="spectral_correction_info" type="Spectral_Correction_Info"/>
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="0" />
+	</xs:complexType>
+	
+	<xs:complexType name="Optical_Components" mixed="true" >
+		<xs:sequence>
+			<xs:element name="optical_component" type="Optical_Component" minOccurs="0" maxOccurs="unbounded" />
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Optical_Component">
+		<xs:sequence>
+			<xs:element name="type" type="Optical_Component_Type_Enum" />
+			<xs:element name="manufacturer" type="xs:string" />
+			<xs:element name="part_id" type="xs:string" />
+			<xs:element name="tag" type="xs:string" />
+			<xs:element name="description" type="xs:string" />
+			<xs:element name="measurement" type="xs:string" />
+			<xs:element name="transmission_range_start_nm" type="xs:double" />
+			<xs:element name="transmission_range_end_nm" type="xs:double" />
+			<xs:element name="measured" type="xs:date" />
+			<xs:element name="sample_points_nm" type="Value_List_Double"/>
+			<xs:element name="response" type="Value_List_Double" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="2" />
+	</xs:complexType>
+	
+	<xs:complexType name="Spectral_Correction_Info">
+		<xs:sequence>
+			<xs:element name="correction_matrices" type="Correction_Matrices" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="0" />
+	</xs:complexType>
+	
+	<xs:complexType name="Correction_Matrices">
+		<xs:sequence>
+			<xs:element name="correction_matrix" type="Correction_Matrix" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Correction_Matrix">
+		<xs:sequence>
+			<xs:element name="name" type="xs:string" />
+			<xs:element name="algorithm" type="Correction_Matrix_Algorithm_Enum" />
+			<xs:element name="algorithm_version" type="xs:string" />
+			<xs:element name="type" type="Correction_Matrix_Type_Enum" />
+			<xs:element name="minimum_band_energy" type="xs:double" />
+			<xs:element name="optical_components" type="Optical_Components" minOccurs="0" />
+			<xs:element name="virtual_bands" type="Virtual_Bands" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="6" />
+		<xs:attribute name="created" type="xs:dateTime" use="required" />
+	</xs:complexType>
+	
+	<xs:complexType name="Virtual_Bands">
+		<xs:sequence>
+			<xs:element name="virtual_band" type="Virtual_Band" minOccurs="0" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Virtual_Band">
+		<xs:sequence>
+			<xs:element name="wavelength_nm" type="xs:double" />
+			<xs:element name="fwhm_nm" type="xs:double" />
+			<xs:element name="coefficients" type="Value_List_Double" />
+		</xs:sequence>
+		<xs:attribute name="version" type="xs:int" use="required" fixed="3" />
+	</xs:complexType>
+	
+</xs:schema>

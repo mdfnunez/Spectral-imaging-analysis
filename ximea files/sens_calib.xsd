@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<xs:schema attributeFormDefault="unqualified" elementFormDefault="qualified" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+	<!-- xiSpec2 camera series file mapping file format, XIMEA -->
+	<!-- V1.0.1, 2021-04-12 -->
+
+	<xs:element name="calibrations" type="Calibrations"/>
+	
+	<xs:complexType name="Calibrations">
+		<xs:sequence>
+			<xs:element name="calibration" type="Calibration" maxOccurs="unbounded"/>
+		</xs:sequence>
+	</xs:complexType>
+	
+	<xs:complexType name="Calibration">
+		<xs:sequence>
+			<xs:element name="file_name" type="xs:string" />
+			<xs:element name="file_link" type="xs:string" />
+		</xs:sequence>
+	</xs:complexType>
+	
+</xs:schema>
