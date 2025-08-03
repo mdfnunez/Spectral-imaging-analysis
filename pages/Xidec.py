@@ -26,27 +26,40 @@ def select_file():
         st.sidebar.success(f"Selected file {b2nd_file}")
 
         # white reference
-        white_path = easygui.fileopenbox('Select white .b2nd', default="/home/alonso/Desktop/")
+        white_path = easygui.fileopenbox('Select white .b2nd', default=default)
         white_stack = blosc2.open(white_path, mode="r")
-        median_mosaic_white = np.median(white_stack, axis=0)
-        white_median = np.array([
-            np.median(median_mosaic_white[i::4, j::4])
-            for i in range(4)
-            for j in range(4)
-        ], dtype=np.float32)
-        st.session_state["white_median"] = white_median
-        
 
-        # dark reference
-        dark_path = easygui.fileopenbox('Select dark folder', default="/home/alonso/Desktop/")
-        dark_stack = blosc2.open(dark_path, mode="r")
-        median_mosaic_dark = np.median(dark_stack, axis=0)
-        dark_median = np.array([
-            np.median(median_mosaic_dark[i::4, j::4])
+        # 1) Mediana temporal: un solo mosaic frame
+        median_mosaic_white = np.median(white_stack, axis=0)  # shape (H, W)
+
+        # 2) Extraer por canal TODO el mapa espacial (sin colapsar):
+        white_per_channel = np.stack(
+            [median_mosaic_white[i::4, j::4]
             for i in range(4)
-            for j in range(4)
-        ], dtype=np.float32)
-        st.session_state["dark_median"] = dark_median
+            for j in range(4)],
+            axis=0
+        ).astype(np.float32)  # shape (16, H/4, W/4)
+
+        st.session_state["white_median"] = white_per_channel
+
+
+     # dark reference
+        dark_path = easygui.fileopenbox('Select dark .b2nd', default=default)
+        dark_stack = blosc2.open(dark_path, mode="r")
+
+        # 1) Mediana temporal: un solo “mosaic frame”
+        median_mosaic_dark = np.median(dark_stack, axis=0)  # shape (H, W)
+
+        # 2) Extraer TODO el mapa espacial de cada canal (sin colapsar):
+        dark_per_channel = np.stack(
+            [median_mosaic_dark[i::4, j::4]
+            for i in range(4)
+            for j in range(4)],
+            axis=0
+        ).astype(np.float32)  # shape (16, H/4, W/4)
+
+        st.session_state["dark_median"] = dark_per_channel
+
        
 
     else:
@@ -89,7 +102,9 @@ def load_wavelengths():
     root = tree.getroot()
     bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index",0)))
     wls = [float(b.find("peaks/peak/wavelength_nm").text) for b in bands]
+   
     return np.array(wls, dtype=np.float32)
+
 
 def load_responsivity_scalar():
     """
@@ -163,8 +178,28 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
         np.mean([float(v) for v in b.find("response").attrib["values"].split()])
         for b in bands
     ], dtype=np.float32)
+
+    #Reordering the channels
     wavelengths = np.array([float(b.find("peaks/peak/wavelength_nm").text) for b in bands], dtype=np.float32)
-    sort_idx = np.argsort(wavelengths)  # para ordenar canales
+    sort_idx   = np.argsort(wavelengths)  # para ordenar canales
+
+    # --- 1.b) Confirmación de orden correcto ---
+    # Extraemos las λ ya ordenadas
+    wls_sorted = wavelengths[sort_idx]
+    # Verificamos que estén en orden no decreciente
+    if np.all(np.diff(wls_sorted) >= 0):
+        st.success("✅ Canales reordenados correctamente por longitud de onda.")
+    else:
+        st.error("⚠️ ¡Ocurrió un problema! Las longitudes de onda no están ordenadas.")
+
+    # Mostramos una tabla del mapeo original → nueva posición
+    df_check = pd.DataFrame({
+        "Nueva posición k": np.arange(len(sort_idx)),
+        "Canal original m":   sort_idx,
+        "λ (nm) ordenada":     wls_sorted.round(1)
+    })
+    st.subheader("Comprobación de reordenamiento espectral")
+    st.dataframe(df_check, hide_index=True)
 
     # --- 2) Preparar datos base ---
     N, H, W = b2nd.shape
@@ -213,16 +248,6 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
             description=description
         )
 
-        # Vista previa RGB del primer frame
-        if idx == 0:
-            rgb_preview = np.stack([refl_sorted[2], refl_sorted[7], refl_sorted[11]], axis=-1)
-            rgb_preview = rgb_preview.astype(np.uint8)
-            fig, ax = plt.subplots()
-            ax.imshow(rgb_preview)
-            ax.set_title(f"Vista previa RGB Frame 0")
-            ax.axis("off")
-            st.pyplot(fig)
-
         progress.progress((idx + 1) / N)
 
     # --- Guardar NPZ con todos los frames calibrados ---
@@ -231,7 +256,12 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
 
     first_ts = timestamps[0].replace("-", "").replace("_", "")
     npz_path = os.path.join(default, f"{first_ts}_reflectance.npz")
-    np.savez(npz_path, reflectance=all_refl)
+    # justo antes de np.savez(...)
+    timestamps = np.array(timestamps, dtype="U")  
+    np.savez(npz_path,
+            reflectance=all_refl,
+            timestamps=timestamps)
+
     
 
     # --- Log final ---
@@ -292,14 +322,7 @@ def front_end():
             mosaic_pattern(b2nd)
             st.session_state.logs.append("Mosaic pattern shown")
 
-            # Tabla canal→λ
-            wavelengths = load_wavelengths()
-            df_map = pd.DataFrame({
-                "Canal (index)": np.arange(len(wavelengths)),
-                "Wavelength (nm)": wavelengths
-            })
-            st.subheader("Channel → Wavelength map")
-            st.dataframe(df_map, hide_index=True)
+          
 
         # ─── Botón de demosaic + calibración ──────────────────
         with col1:
@@ -310,7 +333,20 @@ def front_end():
                     xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml",
                     dark_vec=st.session_state.dark_median,
                     white_vec=st.session_state.white_median                )
-        
+        with col3:
+            st.subheader("Logs")
+            st.markdown("**Physical wavelengths obtained from xml file**")
+
+            # Crea el DataFrame de un plumazo
+            df_phys = pd.DataFrame({
+                "Canal": np.arange(len(wls)),
+                "Wavelength (nm)": wls
+            })
+
+            # Muéstralo con Streamlit
+            st.dataframe(df_phys, hide_index=True)
+
+                
   
 
 
