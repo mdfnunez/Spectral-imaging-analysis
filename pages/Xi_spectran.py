@@ -115,9 +115,11 @@ def band_selection():
     root = tree.getroot()
     bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index", 0)))
     wavelengths = np.array([float(b.find("peaks/peak/wavelength_nm").text) for b in bands], dtype=np.float32)
+    
+    #Arranged from lower to maximum wavelengths
     wavelengths=np.sort(wavelengths)
 
-    # --- 2) Leer espectro molar desde Excel ---
+    #load absorption coefficients HbO2 and Hb
     df_spec = pd.read_excel("ximea files/HbO2_Hb_spectrum_full.xlsx")
 
     # --- 3) Band selection interface ---
@@ -126,20 +128,21 @@ def band_selection():
     with col2:
         band2 = st.slider("Select band for Hb", min_value=0, max_value=15, value=5, step=1, key="band2_spec")
 
+    #Selection of wavelength in wavelengths with the sliders
     λ1 = int(wavelengths[band1])
     λ2 = int(wavelengths[band2])
 
 
-    # --- 5) Filtrar entre 400 y 700 nm ---
+    # --- 5) Select wavelengths withing 400 and 700 nm ---
     df_zoom = df_spec[(df_spec["lambda"] >= 450) & (df_spec["lambda"] <= 650)]
 
-    # --- 6) Graficar espectros y bandas seleccionadas ---
+    # --- 6) Graph with molar coefficients and selection of bands ---
     with col2:
-        with st.expander('Molar extinction graph', expanded=True):
+        with st.expander('Molar extinction graph and selected bands', expanded=True):
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.plot(df_zoom["lambda"], df_zoom["Hb02"], label="ε HbO₂", color="crimson")
             ax.plot(df_zoom["lambda"], df_zoom["Hb"], label="ε Hb", color="royalblue")
-            ax.fill_between(df_zoom["lambda"], df_zoom["Hb02"], df_zoom["Hb"], color='gray', alpha=0.2)
+            ax.fill_between(df_zoom["lambda"], df_zoom["Hb02"], df_zoom["Hb"], color='gray', alpha=0.4)
 
             ax.axvline(λ1, color="crimson", linestyle="--", lw=2, label=f"Band HbO₂ ~ {λ1} nm")
             ax.axvline(λ2, color="royalblue", linestyle="--", lw=2, label=f"Band Hb ~ {λ2} nm")
@@ -149,43 +152,33 @@ def band_selection():
             ax.set_title("Molar extinction spectrum")
             ax.grid(True)
             ax.legend()
-            st.caption('Coefficients and selected bands')
             st.pyplot(fig)
 
+
     # Buscar coincidencia cercana a λ1
-    match1 = df_spec[np.isclose(df_spec["lambda"], λ1, atol=1e-2)]
-    if not match1.empty:
-        row1 = match1.iloc[0]
-        st.write(f"Coincidencia exacta para λ1 = {λ1}:", row1)
-    else:
-        idx1 = (df_spec["lambda"] - λ1).abs().idxmin()
-        row1 = df_spec.loc[idx1]
-        st.warning(f"No se encontró coincidencia exacta para λ1 = {λ1}, usando el valor más cercano:")
-        st.write(row1)
+    match1 = df_spec[np.isclose(df_spec["lambda"], λ1, atol=2)]
 
     # Buscar coincidencia cercana a λ2
-    match2 = df_spec[np.isclose(df_spec["lambda"], λ2, atol=1e-2)]
-    if not match2.empty:
-        row2 = match2.iloc[0]
-        st.write(f"Coincidencia exacta para λ2 = {λ2}:", row2)
-    else:
-        idx2 = (df_spec["lambda"] - λ2).abs().idxmin()
-        row2 = df_spec.loc[idx2]
-        st.warning(f"No se encontró coincidencia exacta para λ2 = {λ2}, usando el valor más cercano:")
-        st.write(row2)
-
-
-
+    match2 = df_spec[np.isclose(df_spec["lambda"], λ2, atol=2)]
+   
     # Si todo bien, accede
     row1 = match1.iloc[0]
     row2 = match2.iloc[0]
 
     #acquire absorbance coefficients
     Hb02_λ1 = row1['Hb02']
-    st.write(Hb02_λ1)
     Hb_λ1   = row1['Hb']
     Hb02_λ2 = row2['Hb02']
     Hb_λ2   = row2['Hb']
+    data=pd.DataFrame([{"HbO2-1":Hb02_λ1,"HbO2-2":Hb02_λ2, "Hb1": Hb_λ1, "Hb2":Hb_λ2}])
+    st.dataframe(data,hide_index=True)
+   
+    E = np.array([
+        [Hb02_λ1, Hb_λ1],
+        [Hb02_λ2, Hb_λ2]
+    ])
+    print("Matriz E:\n", E)
+    print("Determinante:", np.linalg.det(E))
 
     # --- 8) Matriz de extinción y determinante ---
     E = np.array([
@@ -193,20 +186,69 @@ def band_selection():
         [Hb02_λ2, Hb_λ2]
     ])
     det = np.linalg.det(E)
+    condition_number = np.linalg.cond(E)
+
 
     if abs(det) < 0.01:
         st.warning(f"⚠️ Determinante muy bajo ({det:.4f}). Riesgo de inestabilidad numérica.")
     elif abs(det) < 0.05:
         st.info(f"ℹ️ Determinante moderado ({det:.4f}). Aceptable, pero con precaución.")
     else:
-        st.success(f"✅ Determinante adecuado: {det:.4f}")
+        st.success(f"✅ Determinant adequate: {det:.4f}")
+    
+    if condition_number > 1000:
+        st.warning(f"⚠️ Alta inestabilidad numérica. Número de condición: {condition_number:.2f}")
+    elif condition_number > 100:
+        st.info(f"ℹ️ Condición moderada. Número de condición: {condition_number:.2f}")
+    else:
+        st.success(f"✅ Buena condición numérica: {condition_number:.2f}")
+
 
 
     return λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2
 
+
+
+#Extended beer lambert calculations
+def beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack,original_stack,timestamps):
+    #Calculations based on como se compara este metodo con un beer lambert simple que no condidera pathleng ni g ni DPF from Neil T. Clancy
+    #Tissue hemoglobin index (THI)
+    #StO2 index
+
+    #AShow metadata (timestamps)
+    data_sto2=pd.DataFrame(timestamps)
+    st.session_state.logs.append(f" Timestamps:{data_sto2}")
+
+
+    #Normalize to 0-1
+    reflectance_norm = reflectance_stack / np.max(reflectance_stack)
+    reflectance_norm = np.clip(reflectance_norm, 1e-6, 1.0)
+    st.write(reflectance_norm[0,0,:,:])
+
+    # Negative natural logaritm to obtain absorbance
+    absorbance_stack=-np.log(reflectance_norm)
+    st.write(absorbance_stack[0,0,:,:])
+
+    with col1:
+        with st.expander('Modified Beer-Lambert calculations',expanded=True):
+            st.empty()
+    with col2:
+            st.empty()
+
+
+
+
+
+
+
+
 col1,col2,col3=st.columns([1,1,0.5])
 with col1:
-    band_selection()
+    λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2=band_selection()
+    try:
+        beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack,original_stack,timestamps)
+    except:
+        st.warning('Upload .npz and .tiff files')
 with col2:
     st.empty()
 with col3:
