@@ -28,67 +28,80 @@ header_agsantos()
 
 def folder_path_acquisition():
     # ———————————————————————————————
-    # 1) Reflectance NPZ
+    # 1) Reflectance NPY (memmap)
     # ———————————————————————————————
-    if st.sidebar.button('Add reflectance .npz file',key=9815):
+    if st.sidebar.button('Add reflectance .npy file', key=9815):
         path = easygui.fileopenbox(
-            msg="Select a .npz file with reflectance stacks",
+            msg="Select a .npy file with reflectance stacks",
             default="/home/alonso/Desktop/",
-            filetypes=["*.npz"]
+            filetypes=["*.npy"]
         )
         if path:
-            data = np.load(path, allow_pickle=True)
-            reflectance_stack = data["reflectance"]
+            # OJO: mmap_mode evita copiar a RAM
+            data = np.load(path, allow_pickle=False, mmap_mode="r")
+            reflectance_stack = data  # memmap-like
+
+            # fuerza float32 si originalmente fuera float64 (sin copiar entero)
+            if reflectance_stack.dtype == np.float64:
+                st.warning("Reflectance en float64. Convertiré por bloques a float32 si procesas todo.")
 
             st.session_state['reflectance_stack'] = reflectance_stack
-            st.session_state['reflectance_npz_path'] = path
-            st.session_state["path"] = path
+            
 
-            # Inicializa logs si no existe
             if "logs" not in st.session_state:
                 st.session_state.logs = []
-            st.session_state.logs.append(f"✅ Reflectance cargada con shape: {reflectance_stack.shape}")
-            st.session_state.logs.append(f"Stack information: {data.files}")
-            timestamps=data["timestamps"]
-            st.session_state["timestamps"]=timestamps
+            st.session_state.logs.append(
+                f"✅ Reflectance (memmap) shape: {reflectance_stack.shape}, dtype: {reflectance_stack.dtype}"
+            )
 
-    # Mostrar la ruta aunque no se presione el botón (persistente)
-    if "path" in st.session_state:
-        st.sidebar.caption(st.session_state['path'])
+           
 
-
-# ———————————————————————————————
-# 2) Original TIFF folder
-# ———————————————————————————————
-    if st.sidebar.button("Add folder with .tiff files",key=3456):
+    # ———————————————————————————————
+    # 2) Original TIFF folder (solo rutas, nada de stack)
+    # ———————————————————————————————
+    if st.sidebar.button("Add folder with .tiff files", key=3456):
         folder = easygui.diropenbox(
             msg='Select folder with original .tiff images',
             default="/home/alonso/Desktop"
         )
         if folder:
-            imgs = []
+            files = []
             for fn in sorted(os.listdir(folder)):
                 if fn.lower().endswith((".tif", ".tiff")) and not fn.startswith("."):
-                    try:
-                        imgs.append(tiff.imread(os.path.join(folder, fn)))
-                    except Exception as e:
-                        st.warning(f"Skipping {fn}: {e}")
-            if imgs:
-                stack = np.stack(imgs, axis=0)
-                st.session_state['original_stack'] = stack
+                    files.append(os.path.join(folder, fn))
+            if files:
+                st.session_state['original_tiff_paths'] = files
                 st.session_state['original_folder_path'] = folder
-                st.session_state.logs.append(f"✅ Original TIFF stack: {stack.shape}")
+                st.session_state.logs.append(f"✅ {len(files)} TIFFs listados (no apilados).")
             else:
                 st.error("⚠️ No valid TIFFs found.")
+
     if "original_folder_path" in st.session_state:
         st.sidebar.caption(st.session_state["original_folder_path"])
 
-        return (
-            st.session_state.get('reflectance_stack', None),
-            st.session_state.get('original_stack', None),
-            st.session_state.get("timestamps",None)
-            
-        )
+
+
+    #3 add timestamps
+    if st.sidebar.button('Add timestamps'):
+        timestamps_path = easygui.fileopenbox(
+                msg="Select a .npy file with timestamps stacks",
+                default="/home/alonso/Desktop/",
+                filetypes=["*.npy"])
+        if timestamps_path:
+                # OJO: mmap_mode evita copiar a RAM
+                ts = np.load(timestamps_path, allow_pickle=False, mmap_mode="r")
+                timestamps = ts  # memmap-like
+                st.session_state["timestamps"]=timestamps
+
+
+    return (
+        st.session_state.get('reflectance_stack', None),
+        st.session_state.get('original_tiff_paths', None),
+        st.session_state.get("timestamps", None)
+    )
+
+
+
 
 def coefficients_show():
     # Cargar archivo Excel
@@ -209,31 +222,153 @@ def band_selection():
 
 
 
-#Extended beer lambert calculations
-def beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack,original_stack,timestamps):
-    #Calculations based on como se compara este metodo con un beer lambert simple que no condidera pathleng ni g ni DPF from Neil T. Clancy
-    #Tissue hemoglobin index (THI)
-    #StO2 index
+from numpy.lib.format import open_memmap
 
-    #AShow metadata (timestamps)
-    data_sto2=pd.DataFrame(timestamps)
-    st.session_state.logs.append(f" Timestamps:{data_sto2}")
+import os
+import numpy as np
+from numpy.lib.format import open_memmap
 
+def beer_lambert_calculations(
+    λ1, λ2,
+    Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2,
+    E_unused,       # mantenido por compatibilidad, no se usa
+    band1, band2,
+    reflectance_stack,   # memmap/ndarray: (I, B, H, W) abierto con mmap_mode="r"
+    original_stack=None, # no usado aquí
+    timestamps=None,     # no usado aquí
+    block_size=8,
+    out_dir=None,        # si no es None, guarda memmaps: cHbO2, cHb, THb (como .npy)
+    mask_range=(1e-5, 3e-4)  # para el preview de máscara
+):
+    """
+    Opción A (segura): no modifica el archivo original y no sobrecarga la RAM.
+    - Lee el stack en streaming por bloques.
+    - Calcula rmax (1ª pasada).
+    - Calcula absorbancia y THb/cHbO2/cHb por bloques (2ª pasada).
+    - Si out_dir se especifica, guarda salidas en .npy (memmap) float32: (I,H,W).
+    - Devuelve un preview de THb[0] enmascarado para visualizar.
+    """
+    # ── 0) Streamlit opcional
+    try:
+        import streamlit as st
+        import matplotlib.pyplot as plt
+    except Exception:
+        class _Dummy:
+            def __getattr__(self, name): 
+                return lambda *a, **k: None
+        st = _Dummy()
+        # matplotlib solo si existe entorno gráfico; si no, no pasa nada.
 
-    #Normalize to 0-1
-    reflectance_norm = reflectance_stack / np.max(reflectance_stack)
-    reflectance_norm = np.clip(reflectance_norm, 1e-6, 1.0)
-    st.write(reflectance_norm[0,0,:,:])
+    # ── 1) Shapes y matriz de extinción
+    I, B, H, W = reflectance_stack.shape
+    E = np.array([[Hb02_λ1, Hb_λ1],
+                  [Hb02_λ2, Hb_λ2]], dtype=np.float32)
 
-    # Negative natural logaritm to obtain absorbance
-    absorbance_stack=-np.log(reflectance_norm)
-    st.write(absorbance_stack[0,0,:,:])
+    det = float(np.linalg.det(E))
+    cond = float(np.linalg.cond(E))
+    if abs(det) < 0.01:
+        st.warning(f"⚠️ Determinante muy bajo ({det:.4f}). Riesgo de inestabilidad.")
+    elif abs(det) < 0.05:
+        st.info(f"ℹ️ Determinante moderado ({det:.4f}). Úsalo con cautela.")
+    else:
+        st.success(f"✅ Determinante adecuado: {det:.4f}")
+    if cond > 1000:
+        st.warning(f"⚠️ Número de condición alto: {cond:.2f}")
+    elif cond > 100:
+        st.info(f"ℹ️ Condición moderada: {cond:.2f}")
+    else:
+        st.success(f"✅ Buena condición numérica: {cond:.2f}")
 
-    with col1:
-        with st.expander('Modified Beer-Lambert calculations',expanded=True):
-            st.empty()
-    with col2:
-            st.empty()
+    invE = np.linalg.inv(E).astype(np.float32, copy=False)
+    a, b = float(invE[0,0]), float(invE[0,1])
+    c, d = float(invE[1,0]), float(invE[1,1])
+
+    # ── 2) PASADA 1: rmax por streaming (barra de progreso)
+    p1 = st.progress(0, text="Paso 1/2: Calculando rmax…")
+    rmax = None
+    for start in range(0, I, block_size):
+        end = min(start + block_size, I)
+        bmax = np.max(reflectance_stack[start:end])
+        rmax = bmax if rmax is None else max(rmax, bmax)
+        p1.progress(min(end / I, 1.0), text="Paso 1/2: Calculando rmax…")
+    rmax = np.float32(1.0 if rmax is None else rmax)
+    p1.empty()
+    st.caption(f"rmax (global): {float(rmax):.6g}")
+
+    # ── 3) Salidas como memmap .npy (solo si se solicitó)
+    mm_cHbO2 = mm_cHb = mm_THb = None
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        mm_cHbO2 = open_memmap(os.path.join(out_dir, "cHbO2.npy"), mode="w+", dtype=np.float32, shape=(I, H, W))
+        mm_cHb   = open_memmap(os.path.join(out_dir, "cHb.npy"),   mode="w+", dtype=np.float32, shape=(I, H, W))
+        mm_THb   = open_memmap(os.path.join(out_dir, "THb.npy"),   mode="w+", dtype=np.float32, shape=(I, H, W))
+
+    # ── 4) PASADA 2: procesamiento por bloques (buffer escribible) + barra
+    p2 = st.progress(0, text="Paso 2/2: Procesando por bloques…")
+    preview_thb0 = None
+    lo, hi = mask_range
+
+    for start in range(0, I, block_size):
+        end = min(start + block_size, I)
+
+        # Buffer escribible en float32
+        src  = reflectance_stack[start:end]               # (n,B,H,W) read-only
+        buf  = np.array(src, dtype=np.float32, copy=True) # (n,B,H,W) escribible
+
+        # Normalización + clipping in-place
+        buf /= rmax
+        np.clip(buf, 1e-2, 1.0, out=buf)
+
+        # Absorbancia in-place: -log(buf)
+        np.log(buf, out=buf)
+        buf *= -1.0
+
+        # Bandas
+        A1 = buf[:, band1, :, :]
+        A2 = buf[:, band2, :, :]
+
+        # Combinaciones lineales
+        cHbO2_blk = a * A1 + b * A2
+        cHb_blk   = c * A1 + d * A2
+        THb_blk   = cHbO2_blk + cHb_blk
+
+        # Escribir a disco si procede
+        if mm_THb is not None:
+            mm_cHbO2[start:end] = cHbO2_blk
+            mm_cHb[start:end]   = cHb_blk
+            mm_THb[start:end]   = THb_blk
+            mm_cHbO2.flush(); mm_cHb.flush(); mm_THb.flush()
+
+        # Primer frame para preview
+        if preview_thb0 is None:
+            thb0 = THb_blk[0]  # (H,W)
+            mask = (thb0 > lo) & (thb0 < hi)
+            preview_thb0 = np.where(mask, thb0, np.nan).astype(np.float32, copy=False)
+
+        # liberar refs
+        del cHbO2_blk, cHb_blk, THb_blk, A1, A2, buf, src
+
+        p2.progress(min(end / I, 1.0), text="Paso 2/2: Procesando por bloques…")
+    p2.empty()
+
+    # ── 5) Visualización: matriz E y preview de THb[0]
+    st.caption('Matriz de coeficientes de extinción (E)')
+    st.dataframe(E)
+    if preview_thb0 is not None:
+        fig, ax = plt.subplots()
+        cax = ax.imshow(preview_thb0, cmap='inferno', vmin=0, vmax=float(hi))
+        fig.colorbar(cax, ax=ax)
+        ax.set_title("THb[0] enmascarado")
+        st.pyplot(fig)
+
+    return {
+        "determinant": det,
+        "condition_number": cond,
+        "rmax": float(rmax),
+        "preview_masked_THb0": preview_thb0,   # (H,W) float32 con NaNs fuera de rango
+        "outputs_dir": out_dir,
+        "shapes": {"I": I, "B": B, "H": H, "W": W}
+    }
 
 
 
@@ -245,10 +380,10 @@ def beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, b
 col1,col2,col3=st.columns([1,1,0.5])
 with col1:
     λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2=band_selection()
-    try:
+    run_calculations=st.button('Run calculations')
+    if run_calculations:
         beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack,original_stack,timestamps)
-    except:
-        st.warning('Upload .npz and .tiff files')
+        
 with col2:
     st.empty()
 with col3:

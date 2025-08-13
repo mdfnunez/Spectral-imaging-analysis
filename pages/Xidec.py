@@ -166,6 +166,15 @@ responsivity=load_responsivity_scalar()
 
 
 def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
+    import os, json
+    import numpy as np
+    import pandas as pd
+    import xml.etree.ElementTree as ET
+    import streamlit as st
+    from tifffile import imwrite
+
+    from numpy.lib.format import open_memmap  # 👈 clave para .npy sin RAM
+
     default = "/home/alonso/Desktop/"
     tiff_dir = os.path.join(default, "tiffs")
     os.makedirs(tiff_dir, exist_ok=True)
@@ -179,24 +188,22 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
         for b in bands
     ], dtype=np.float32)
 
-    #Reordering the channels
-    wavelengths = np.array([float(b.find("peaks/peak/wavelength_nm").text) for b in bands], dtype=np.float32)
-    sort_idx   = np.argsort(wavelengths)  # para ordenar canales
-
-    # --- 1.b) Confirmación de orden correcto ---
-    # Extraemos las λ ya ordenadas
+    wavelengths = np.array(
+        [float(b.find("peaks/peak/wavelength_nm").text) for b in bands],
+        dtype=np.float32
+    )
+    sort_idx = np.argsort(wavelengths)
     wls_sorted = wavelengths[sort_idx]
-    # Verificamos que estén en orden no decreciente
+
     if np.all(np.diff(wls_sorted) >= 0):
         st.success("✅ Canales reordenados correctamente por longitud de onda.")
     else:
         st.error("⚠️ ¡Ocurrió un problema! Las longitudes de onda no están ordenadas.")
 
-    # Mostramos una tabla del mapeo original → nueva posición
     df_check = pd.DataFrame({
         "Nueva posición k": np.arange(len(sort_idx)),
-        "Canal original m":   sort_idx,
-        "λ (nm) ordenada":     wls_sorted.round(1)
+        "Canal original m": sort_idx,
+        "λ (nm) ordenada": wls_sorted.round(1)
     })
     st.subheader("Comprobación de reordenamiento espectral")
     st.dataframe(df_check, hide_index=True)
@@ -209,28 +216,48 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
 
     meta_list = [{k.decode(): meta[k][i] for k in keys} for i in range(N)]
     st.session_state["meta_list"] = meta_list
-    st.dataframe(meta_list, hide_index=False)
-    refl_list = []
-    progress = st.progress(0)
+
+    # --- 3) Evitar RAM: open_memmap hacia .npy directamente ---
+    first_ts = timestamps[0].replace("-", "").replace("_", "")
+    npy_path = os.path.join(default, f"{first_ts}_reflectance.npy")
+    ts_npy_path = os.path.join(default, f"{first_ts}_timestamps.npy")
+
+    # crea archivo .npy mapeable, de tamaño final (N, 16, H//4, W//4)
+    all_refl = open_memmap(
+        npy_path, mode="w+", dtype=np.float32, shape=(N, 16, H // 4, W // 4)
+    )
+
+    # timestamps en array de unicode (tamaño suficiente para tus strings)
+    ts_array = np.empty(N, dtype=f"<U{max(len(t) for t in timestamps)}")
+
+    # Convertir white/dark a float32 y asegurar forma correcta
+    dark_vec = dark_vec.astype(np.float32)
+    white_vec = white_vec.astype(np.float32)
+    resp = resp_scalar[:, None, None]
+
+    # --- 4) Procesar frame por frame ---
+    progress = st.progress(0.0)
 
     for idx in range(N):
         frame = b2nd[idx]
+
+        # Separar canales del mosaico 4x4
         chans = [frame[i::4, j::4] for i in range(4) for j in range(4)]
         chan = np.stack(chans, axis=0).astype(np.float32)
 
         # --- Calibración ---
-        dark = dark_vec[:, None, None].astype(np.float32)
-        white = white_vec[:, None, None].astype(np.float32)
-        resp = resp_scalar[:, None, None]
         with np.errstate(divide='ignore', invalid='ignore'):
-            norm = (chan - dark) / (white - dark + 1e-6)
+            norm = (chan - dark_vec) / (white_vec - dark_vec + 1e-6)
         refl = norm / resp
 
-        # --- Reordenar por longitud de onda ---
+        # --- Reordenar canales ---
         refl_sorted = refl[sort_idx]
-        refl_list.append(refl_sorted)
 
-            # Escala cada imagen TIFF individualmente
+        # Guardar en memmap .npy (sin RAM total)
+        all_refl[idx] = refl_sorted
+        ts_array[idx] = timestamps[idx]
+
+        # --- Guardar TIFF individual (opcional, para inspección) ---
         refl_norm = refl_sorted - refl_sorted.min()
         refl_norm /= (refl_norm.max() + 1e-6)
         refl_to_save = (refl_norm * 65535).astype(np.uint16)
@@ -250,30 +277,20 @@ def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
 
         progress.progress((idx + 1) / N)
 
-    # --- Guardar NPZ con todos los frames calibrados ---
+    # --- 5) Guardar timestamps en .npy aparte (también mapeable después) ---
+    np.save(ts_npy_path, ts_array)
 
-    all_refl = np.stack(refl_list, axis=0)
-
-    first_ts = timestamps[0].replace("-", "").replace("_", "")
-    npz_path = os.path.join(default, f"{first_ts}_reflectance.npz")
-    # justo antes de np.savez(...)
-    timestamps = np.array(timestamps, dtype="U")  
-    np.savez(npz_path,
-            reflectance=all_refl,
-            timestamps=timestamps)
-
-    
-
-    # --- Log final ---
+    # --- 6) Log final ---
     st.session_state.logs.append("✅ Archivos guardados correctamente:")
     st.session_state.logs.append(f"📂 TIFF multicanal en: {tiff_dir}")
-    st.session_state.logs.append(f"📦 Archivo .npz: {npz_path}")
+    st.session_state.logs.append(f"📦 Archivo .npy (reflectance): {npy_path}")
+    st.session_state.logs.append(f"🕒 Timestamps .npy: {ts_npy_path}")
     st.session_state.logs.append("📊 Orden espectral aplicado:")
     st.session_state.logs.append(f"Orden: {sort_idx.tolist()}")
-    st.session_state.logs.append(f"Wavelengths ordenados (nm): {wavelengths[sort_idx].round(1).tolist()}")
+    st.session_state.logs.append(f"Wavelengths ordenados (nm): {wls_sorted.round(1).tolist()}")
     st.session_state.logs.append("-" * 40)
 
-
+    return npy_path, ts_npy_path, tiff_dir
 
 def front_end():
     # ─── Inicializar session_state ──────────────────────────
