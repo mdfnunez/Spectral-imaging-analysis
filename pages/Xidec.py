@@ -5,20 +5,29 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
-import os
-from tifffile import imwrite
 from datetime import datetime
-import json
+from tifffile import imwrite
+from numpy.lib.format import open_memmap  # 👈 clave para .npy sin RAM
+import os, json
 
-
+#Header
 st.set_page_config('Xidec',layout="wide")
 st.title('Xidec')
-st.caption('Decompression of .b2nd files from the Xilens program')
+st.caption('Software for decompression of .b2nd files from the Xilens program')
 
+# Paths
+global default
 default="/home/alonso/Desktop/"
+global xml_path
+xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
 
+#Functions
+st.caption('Logs')
+logs=st.empty()
+
+logs.write("inicial")
 def select_file():
-    b2nd_file=easygui.fileopenbox('Select .b2nd file',default="/home/alonso/Desktop/")
+    b2nd_file=easygui.fileopenbox('Select .b2nd file',default=default)
     if b2nd_file is not None:
         # carga .b2nd
         b2nd_loaded = blosc2.open(b2nd_file, mode="r")
@@ -29,7 +38,7 @@ def select_file():
         white_path = easygui.fileopenbox('Select white .b2nd', default=default)
         white_stack = blosc2.open(white_path, mode="r")
 
-        # 1) Mediana temporal: un solo mosaic frame
+        # Median from the white stack and gives a single frame H,W with the median for each pixel
         median_mosaic_white = np.median(white_stack, axis=0)  # shape (H, W)
 
         # 2) Extraer por canal TODO el mapa espacial (sin colapsar):
@@ -95,202 +104,99 @@ def mosaic_pattern(b2nd_loaded):
     st.pyplot(fig)
     st.caption('Mosaic pattern 4x4, 16 indexes shown in red, the pattern is repeated every 4x4 (rows x columns)')
 
-@st.cache_data
-def load_wavelengths():
-    xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index",0)))
-    wls = [float(b.find("peaks/peak/wavelength_nm").text) for b in bands]
-   
-    return np.array(wls, dtype=np.float32)
+def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec,
+                      white_dark_order="index"):  # "index" o "lambda"
 
-
-def load_responsivity_scalar():
-    """
-    Lee del XML las curvas de responsividad y las promedia para obtener
-    un único scalar por banda.
-    Devuelve array shape (n_canales,).
-    """
-    xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
-
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index",0)))
-    resp_curves = []
-    for b in bands:
-        vals = b.find("response").attrib.get("values","").split()
-        curve = np.array([float(v) for v in vals], dtype=np.float32)
-        resp_curves.append(curve)
-    # responsividad media por banda:
-    return np.array([c.mean() for c in resp_curves], dtype=np.float32)
-
-def false_color_image(channels: np.ndarray,
-                      rgb_indices: tuple[int,int,int] = (2, 7, 11)
-                     ) -> np.ndarray:
-   
-    r = channels[rgb_indices[0]]
-    g = channels[rgb_indices[1]]
-    b = channels[rgb_indices[2]]
-    
-    def norm(x):
-        mn, mx = np.nanmin(x), np.nanmax(x)
-        return (x - mn) / (mx - mn + 1e-6)
-    
-    r_n = norm(r)
-    g_n = norm(g)
-    b_n = norm(b)
-    
-    # Stack and convert to uint8
-    img = np.dstack((r_n, g_n, b_n))
-    img8 = (img * 255).astype(np.uint8)
-    return img8
-
-def False_RGB(channels: np.ndarray):
-    with st.expander('RGB image'):
-        if channels is not None:
-            C, H, W = channels.shape
-            st.sidebar.subheader("False color")
-            # Creamos selectboxes para R, G, B
-            r = st.sidebar.selectbox("Red",  list(range(C)), index=2)
-            g = st.sidebar.selectbox("Green", list(range(C)), index=7)
-            b = st.sidebar.selectbox("Blue",  list(range(C)), index=11)
-            
-            if st.sidebar.button("Show false color image"):
-                img_fc = false_color_image(channels, (r, g, b))
-                st.image(img_fc)
-
-wls=load_wavelengths()
-xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
-responsivity=load_responsivity_scalar()
-
-
-def demosaic_and_save(b2nd, xml_path, dark_vec, white_vec):
-    import os, json
-    import numpy as np
-    import pandas as pd
-    import xml.etree.ElementTree as ET
-    import streamlit as st
-    from tifffile import imwrite
-
-    from numpy.lib.format import open_memmap  # 👈 clave para .npy sin RAM
-
-    default = "/home/alonso/Desktop/"
+    os.makedirs(os.path.join(default, "tiffs"), exist_ok=True)
     tiff_dir = os.path.join(default, "tiffs")
-    os.makedirs(tiff_dir, exist_ok=True)
 
-    # --- 1) Cargar responsividad y longitudes de onda desde XML ---
+    # --- 1) XML: responsividad y λ en ORDEN DE ÍNDICE ---
     tree = ET.parse(xml_path)
     root = tree.getroot()
     bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index", 0)))
-    resp_scalar = np.array([
+    logs.write("Hola")
+    resp_scalar_idx = np.array([
         np.mean([float(v) for v in b.find("response").attrib["values"].split()])
         for b in bands
     ], dtype=np.float32)
 
-    wavelengths = np.array(
+    wavelengths_idx = np.array(
         [float(b.find("peaks/peak/wavelength_nm").text) for b in bands],
         dtype=np.float32
     )
-    sort_idx = np.argsort(wavelengths)
-    wls_sorted = wavelengths[sort_idx]
+    # Permutación índice->λ y su inversa λ->índice
+    sort_idx = np.argsort(wavelengths_idx)              # idx -> lambda-order
+    inv_idx = np.empty_like(sort_idx)                   # lambda-order -> idx
+    inv_idx[sort_idx] = np.arange(len(sort_idx))
 
-    if np.all(np.diff(wls_sorted) >= 0):
-        st.success("✅ Canales reordenados correctamente por longitud de onda.")
-    else:
-        st.error("⚠️ ¡Ocurrió un problema! Las longitudes de onda no están ordenadas.")
+    wls_sorted = wavelengths_idx[sort_idx]
 
-    df_check = pd.DataFrame({
-        "Nueva posición k": np.arange(len(sort_idx)),
-        "Canal original m": sort_idx,
-        "λ (nm) ordenada": wls_sorted.round(1)
-    })
-    st.subheader("Comprobación de reordenamiento espectral")
-    st.dataframe(df_check, hide_index=True)
+    resp = resp_scalar_idx[:, None, None]  # broadcast (16,1,1)
 
-    # --- 2) Preparar datos base ---
+    # --- 3) Metadata y archivos de salida ---
     N, H, W = b2nd.shape
     meta = b2nd.schunk.vlmeta
-    timestamps = meta[b'time_stamp']
+    # Asegurar strings
+    raw_ts = meta[b'time_stamp']
+    timestamps = [
+        t.decode() if isinstance(t, (bytes, bytearray)) else str(t)
+        for t in raw_ts
+    ]
     keys = [b'time_stamp', b'exposure_us', b'temperature_chip']
 
-    meta_list = [{k.decode(): meta[k][i] for k in keys} for i in range(N)]
-    st.session_state["meta_list"] = meta_list
-
-    # --- 3) Evitar RAM: open_memmap hacia .npy directamente ---
     first_ts = timestamps[0].replace("-", "").replace("_", "")
-    npy_path = os.path.join(default, f"{first_ts}_reflectance.npy")
-    ts_npy_path = os.path.join(default, f"{first_ts}_timestamps.npy")
+    npy_path   = os.path.join(default, f"{first_ts}_reflectance.npy")
+    ts_npy_path= os.path.join(default, f"{first_ts}_timestamps.npy")
 
-    # crea archivo .npy mapeable, de tamaño final (N, 16, H//4, W//4)
-    all_refl = open_memmap(
-        npy_path, mode="w+", dtype=np.float32, shape=(N, 16, H // 4, W // 4)
-    )
-
-    # timestamps en array de unicode (tamaño suficiente para tus strings)
+    # Memmap destino (N, 16, H/4, W/4)
+    all_refl = open_memmap(npy_path, mode="w+", dtype=np.float32,
+                           shape=(N, 16, H // 4, W // 4))
     ts_array = np.empty(N, dtype=f"<U{max(len(t) for t in timestamps)}")
 
-    # Convertir white/dark a float32 y asegurar forma correcta
-    dark_vec = dark_vec.astype(np.float32)
-    white_vec = white_vec.astype(np.float32)
-    resp = resp_scalar[:, None, None]
-
-    # --- 4) Procesar frame por frame ---
-    progress = st.progress(0.0)
-
+    # --- 4) Procesar frame por frame (calibrar en ORDEN DE ÍNDICE) ---
     for idx in range(N):
         frame = b2nd[idx]
 
-        # Separar canales del mosaico 4x4
+        # Separar canales en ORDEN DE ÍNDICE
         chans = [frame[i::4, j::4] for i in range(4) for j in range(4)]
         chan = np.stack(chans, axis=0).astype(np.float32)
 
-        # --- Calibración ---
         with np.errstate(divide='ignore', invalid='ignore'):
             norm = (chan - dark_vec) / (white_vec - dark_vec + 1e-6)
-        refl = norm / resp
+        refl_idx = norm / resp  # aún en ORDEN DE ÍNDICE
 
-        # --- Reordenar canales ---
-        refl_sorted = refl[sort_idx]
+        # Reordenar por λ SOLO para guardar/salidas
+        refl_sorted = refl_idx[sort_idx]
 
-        # Guardar en memmap .npy (sin RAM total)
+        # Guardar en memmap
         all_refl[idx] = refl_sorted
         ts_array[idx] = timestamps[idx]
 
-        # --- Guardar TIFF individual (opcional, para inspección) ---
-        refl_norm = refl_sorted - refl_sorted.min()
-        refl_norm /= (refl_norm.max() + 1e-6)
-        refl_to_save = (refl_norm * 65535).astype(np.uint16)
+        # (Opcional) Guardar TIFF de 16 canales (orden por λ)
+        r = refl_sorted.copy()
+        r -= r.min()
+        r /= (r.max() + 1e-6)
+        r_u16 = (r * 65535).astype(np.uint16)
 
         ts_str = timestamps[idx].replace("-", "").replace("_", "")
         tiff_path = os.path.join(tiff_dir, f"{ts_str}.tiff")
         description = json.dumps({k.decode(): meta[k][idx] for k in keys})
+        imwrite(tiff_path, r_u16, dtype=np.uint16,
+                photometric="minisblack", metadata=None, description=description)
 
-        imwrite(
-            tiff_path,
-            refl_to_save,
-            dtype=np.uint16,
-            photometric="minisblack",
-            metadata=None,
-            description=description
-        )
-
-        progress.progress((idx + 1) / N)
-
-    # --- 5) Guardar timestamps en .npy aparte (también mapeable después) ---
+    # --- 5) Guardar timestamps y sidecar con info de orden ---
     np.save(ts_npy_path, ts_array)
-
-    # --- 6) Log final ---
-    st.session_state.logs.append("✅ Archivos guardados correctamente:")
-    st.session_state.logs.append(f"📂 TIFF multicanal en: {tiff_dir}")
-    st.session_state.logs.append(f"📦 Archivo .npy (reflectance): {npy_path}")
-    st.session_state.logs.append(f"🕒 Timestamps .npy: {ts_npy_path}")
-    st.session_state.logs.append("📊 Orden espectral aplicado:")
-    st.session_state.logs.append(f"Orden: {sort_idx.tolist()}")
-    st.session_state.logs.append(f"Wavelengths ordenados (nm): {wls_sorted.round(1).tolist()}")
-    st.session_state.logs.append("-" * 40)
+    # Muy útil: guardar sidecar JSON con sort_idx y wls
+    sidecar = {
+        "order": "lambda",                     # el .npy está por λ
+        "sort_idx": sort_idx.tolist(),         # índice->λ
+        "wavelengths_sorted_nm": [float(x) for x in wls_sorted]
+    }
+    with open(os.path.join(default, f"{first_ts}_reflectance.meta.json"), "w") as f:
+        json.dump(sidecar, f, indent=2)
 
     return npy_path, ts_npy_path, tiff_dir
+
 
 def front_end():
     # ─── Inicializar session_state ──────────────────────────
@@ -349,22 +255,14 @@ def front_end():
                     b2nd,
                     xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml",
                     dark_vec=st.session_state.dark_median,
-                    white_vec=st.session_state.white_median                )
+                    white_vec=st.session_state.white_median,
+                                                  )
         with col3:
             st.subheader("Logs")
             st.markdown("**Physical wavelengths obtained from xml file**")
 
-            # Crea el DataFrame de un plumazo
-            df_phys = pd.DataFrame({
-                "Canal": np.arange(len(wls)),
-                "Wavelength (nm)": wls
-            })
 
-            # Muéstralo con Streamlit
-            st.dataframe(df_phys, hide_index=True)
 
-                
-  
 
 
 
