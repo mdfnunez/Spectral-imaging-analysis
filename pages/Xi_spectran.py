@@ -37,24 +37,19 @@ def folder_path_acquisition():
             filetypes=["*.npy"]
         )
         if path:
-            # OJO: mmap_mode evita copiar a RAM
             data = np.load(path, allow_pickle=False, mmap_mode="r")
             reflectance_stack = data  # memmap-like
 
-            # fuerza float32 si originalmente fuera float64 (sin copiar entero)
             if reflectance_stack.dtype == np.float64:
                 st.warning("Reflectance en float64. Convertiré por bloques a float32 si procesas todo.")
 
             st.session_state['reflectance_stack'] = reflectance_stack
-            
 
             if "logs" not in st.session_state:
                 st.session_state.logs = []
             st.session_state.logs.append(
                 f"✅ Reflectance (memmap) shape: {reflectance_stack.shape}, dtype: {reflectance_stack.dtype}"
             )
-
-           
 
     # ———————————————————————————————
     # 2) Original TIFF folder (solo rutas, nada de stack)
@@ -79,26 +74,118 @@ def folder_path_acquisition():
     if "original_folder_path" in st.session_state:
         st.sidebar.caption(st.session_state["original_folder_path"])
 
+    # ———————————————————————————————
+    # 3) Add timestamps / exposure / temperature  (.npz o .npy)
+    # ———————————————————————————————
+    if st.sidebar.button('Add timestamps/exposure/temperature'):
+        fpath = easygui.fileopenbox(
+            msg="Select a .npz (recomendado) o .npy con timestamps/exposure/temperature",
+            default="/home/alonso/Desktop/",
+            filetypes=["*.npz", "*.npy"]
+        )
+        if fpath:
+            try:
+                arr = np.load(fpath, allow_pickle=False, mmap_mode=None)  # mmap None para .npz
+            except Exception as e:
+                st.error(f"No pude abrir el archivo: {e}")
+                arr = None
 
+            timestamps = None
+            exposure = None
+            temperature = None
 
-    #3 add timestamps
-    if st.sidebar.button('Add timestamps'):
-        timestamps_path = easygui.fileopenbox(
-                msg="Select a .npy file with timestamps stacks",
-                default="/home/alonso/Desktop/",
-                filetypes=["*.npy"])
-        if timestamps_path:
-                # OJO: mmap_mode evita copiar a RAM
-                ts = np.load(timestamps_path, allow_pickle=False, mmap_mode="r")
-                timestamps = ts  # memmap-like
-                st.session_state["timestamps"]=timestamps
+            def _to_text(x):
+                return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
 
+            if arr is not None:
+                if hasattr(arr, "files"):  # —— .npz
+                    st.info(f"Claves en NPZ: {arr.files}")
 
+                    # timestamps
+                    for k in ("timestamps", "time_stamp", "times", "ts"):
+                        if k in arr.files:
+                            raw = arr[k]
+                            if raw.dtype.kind in ("S", "O"):
+                                timestamps = np.array([_to_text(v) for v in raw])
+                            else:
+                                timestamps = raw.astype(str)
+                            break
+
+                    # exposure
+                    for k in ("exposure_us", "exposure", "ExposureTime", "exp_us"):
+                        if k in arr.files:
+                            exposure = np.asarray(arr[k])
+                            break
+
+                    # temperature
+                    for k in ("temperature_chip", "ChipTemperature", "temperature", "temp"):
+                        if k in arr.files:
+                            temperature = np.asarray(arr[k])
+                            break
+
+                else:  # —— .npy
+                    npy = arr
+                    if npy.dtype.names:  # estructurado
+                        names = npy.dtype.names
+                        st.info(f"Campos en NPY estructurado: {names}")
+
+                        # timestamps
+                        for k in ("timestamps", "time_stamp", "timestamp", "ts"):
+                            if k in names:
+                                col = npy[k]
+                                timestamps = (np.array([_to_text(v) for v in col])
+                                              if col.dtype.kind in ("S","O") else col.astype(str))
+                                break
+                        # exposure
+                        for k in ("exposure_us", "exposure", "ExposureTime", "exp_us"):
+                            if k in names:
+                                exposure = np.asarray(npy[k])
+                                break
+                        # temperature
+                        for k in ("temperature_chip", "ChipTemperature", "temperature", "temp"):
+                            if k in names:
+                                temperature = np.asarray(npy[k])
+                                break
+                    else:
+                        # simple → asumimos timestamps
+                        flat = np.ravel(npy)
+                        timestamps = (np.array([_to_text(v) for v in flat])
+                                      if flat.dtype.kind in ("S","O") else flat.astype(str))
+
+                # —— Guardar y mostrar (sin afectar el resto del pipeline) ——
+                if timestamps is not None:
+                    st.session_state["timestamps"] = timestamps
+                    st.success(f"Timestamps cargados: {len(timestamps)}")
+                    st.dataframe(pd.DataFrame({"timestamp": timestamps[:20]}),
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.info("No encontré 'timestamps' en el archivo.")
+
+                if exposure is not None:
+                    st.session_state["exposure"] = exposure
+                    st.info(f"Exposure cargado: shape={np.shape(exposure)}, dtype={np.asarray(exposure).dtype}")
+                    st.dataframe(pd.DataFrame({"exposure_us": np.ravel(exposure)[:20]}),
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.info("No encontré 'exposure_us' en el archivo.")
+
+                if temperature is not None:
+                    st.session_state["temperature"] = temperature
+                    st.info(f"Temperature cargada: shape={np.shape(temperature)}, dtype={np.asarray(temperature).dtype}")
+                    st.dataframe(pd.DataFrame({"temperature_chip": np.ravel(temperature)[:20]}),
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.info("No encontré 'temperature_chip' en el archivo.")
+
+    # —— Return (no obliga a que existan exposure/temperature) ——
     return (
         st.session_state.get('reflectance_stack', None),
         st.session_state.get('original_tiff_paths', None),
-        st.session_state.get("timestamps", None)
+        st.session_state.get("timestamps", None),
+        st.session_state.get("exposure", None),
+        st.session_state.get("temperature", None),
     )
+
 
 
 
@@ -120,6 +207,76 @@ except:
 # Ends load variables
 
 
+def show_timestamps_panel(timestamps, reflectance_stack=None, original_tiff_paths=None):
+    st.subheader("Timestamps")
+    if timestamps is None:
+        st.info("No se han cargado timestamps todavía.")
+        return
+
+    # Convertir a texto seguro
+    ts_txt = np.array([t.decode() if isinstance(t, (bytes, bytearray)) else str(t) for t in timestamps])
+    # Parsear a datetime si se puede
+    ts_dt = pd.to_datetime(ts_txt, errors="coerce")  # NaT si no se puede
+    df = pd.DataFrame({"timestamp": ts_txt, "parsed": ts_dt})
+
+    # Métricas básicas
+    n = len(df)
+    n_nat = df["parsed"].isna().sum()
+    st.write(f"Total: **{n}** entradas · Parseables: **{n - n_nat}** · No parseables: **{n_nat}**")
+
+    # Deltas (solo donde hay fecha válida y orden natural)
+    if n > 1 and n_nat < n:
+        # Chequeo de monotonicidad
+        mono = df["parsed"].is_monotonic_increasing if df["parsed"].notna().all() else False
+        if mono:
+            st.success("Orden temporal: Monótono creciente ✅")
+        else:
+            st.warning("Orden temporal: No monótono ⚠️ (hay empates o desorden)")
+
+        # Intervalos
+        dts = df["parsed"].diff().dt.total_seconds()
+        df["Δt [s]"] = dts
+
+        # Resumen de Δt
+        good = dts.dropna()
+        if not good.empty:
+            st.caption(
+                f"Δt (s) → min: {good.min():.6g} · p50: {good.median():.6g} · p95: {good.quantile(0.95):.6g} · max: {good.max():.6g}"
+            )
+
+            # Histograma simple con matplotlib
+            fig, ax = plt.subplots(figsize=(5, 2.8))
+            ax.hist(good.values, bins=min(50, max(5, int(np.sqrt(len(good))))))
+            ax.set_xlabel("Δt entre frames (s)")
+            ax.set_ylabel("Frecuencia")
+            ax.set_title("Distribución de intervalos")
+            st.pyplot(fig)
+
+    # Muestra rápida (cabezal y cola)
+    with st.expander("Ver tabla completa de timestamps", expanded=False):
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+    # Descarga CSV
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Descargar timestamps como CSV", csv, "timestamps.csv", "text/csv")
+
+    # Cross-check con reflectance y TIFFs
+    if reflectance_stack is not None:
+        try:
+            I = reflectance_stack.shape[0]
+            if I == n:
+                st.success(f"Match con reflectance_stack: {I} frames = {n} timestamps ✅")
+            else:
+                st.error(f"Desajuste: reflectance_stack tiene {I} frames y timestamps {n} ⚠️")
+        except Exception:
+            st.info("No se pudo leer shape de reflectance_stack.")
+
+    if original_tiff_paths is not None:
+        m = len(original_tiff_paths)
+        if m == n:
+            st.success(f"Match con TIFFs: {m} imágenes = {n} timestamps ✅")
+        else:
+            st.warning(f"Desajuste con TIFFs: {m} imágenes vs {n} timestamps ⚠️")
 
 #Band selection 
 def band_selection():
@@ -222,11 +379,6 @@ def band_selection():
 
 
 
-from numpy.lib.format import open_memmap
-
-import os
-import numpy as np
-from numpy.lib.format import open_memmap
 
 def beer_lambert_calculations(
     λ1, λ2,
@@ -388,11 +540,17 @@ with col2:
     st.empty()
 with col3:
     coefficients_show()
-    #log column
     st.subheader('Logs')
     if "logs" not in st.session_state:
-        st.session_state.logs=[]
+        st.session_state.logs = []
     st.write(st.session_state.get("logs"))
+
+    # 👇 Añadir este visor:
+    show_timestamps_panel(
+        timestamps=st.session_state.get("timestamps"),
+        reflectance_stack=st.session_state.get("reflectance_stack"),
+        original_tiff_paths=st.session_state.get("original_tiff_paths")
+    )
 
 
 
