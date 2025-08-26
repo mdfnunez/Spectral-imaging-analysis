@@ -4,13 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import easygui
 import os
-import skimage.exposure
-import time
-import tifffile as tiff
-import tkinter as tk
-from tkinter import simpledialog, Button
-from PIL import Image, ImageTk
 import cv2
+import tifffile as tiff
 from bisect import bisect_right
 import xml.etree.ElementTree as ET
 
@@ -50,234 +45,32 @@ def folder_path_acquisition():
             st.session_state.logs.append(
                 f"✅ Reflectance (memmap) shape: {reflectance_stack.shape}, dtype: {reflectance_stack.dtype}"
             )
-
-    # ———————————————————————————————
-    # 2) Original TIFF folder (solo rutas, nada de stack)
-    # ———————————————————————————————
-    if st.sidebar.button("Add folder with .tiff files", key=3456):
-        folder = easygui.diropenbox(
-            msg='Select folder with original .tiff images',
-            default="/home/alonso/Desktop"
-        )
-        if folder:
-            files = []
-            for fn in sorted(os.listdir(folder)):
-                if fn.lower().endswith((".tif", ".tiff")) and not fn.startswith("."):
-                    files.append(os.path.join(folder, fn))
-            if files:
-                st.session_state['original_tiff_paths'] = files
-                st.session_state['original_folder_path'] = folder
-                st.session_state.logs.append(f"✅ {len(files)} TIFFs listados (no apilados).")
-            else:
-                st.error("⚠️ No valid TIFFs found.")
-
-    if "original_folder_path" in st.session_state:
-        st.sidebar.caption(st.session_state["original_folder_path"])
-
-    # ———————————————————————————————
-    # 3) Add timestamps / exposure / temperature  (.npz o .npy)
-    # ———————————————————————————————
-    if st.sidebar.button('Add timestamps/exposure/temperature'):
-        fpath = easygui.fileopenbox(
-            msg="Select a .npz (recomendado) o .npy con timestamps/exposure/temperature",
-            default="/home/alonso/Desktop/",
-            filetypes=["*.npz", "*.npy"]
-        )
-        if fpath:
-            try:
-                arr = np.load(fpath, allow_pickle=False, mmap_mode=None)  # mmap None para .npz
-            except Exception as e:
-                st.error(f"No pude abrir el archivo: {e}")
-                arr = None
-
-            timestamps = None
-            exposure = None
-            temperature = None
-
-            def _to_text(x):
-                return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
-
-            if arr is not None:
-                if hasattr(arr, "files"):  # —— .npz
-                    st.info(f"Claves en NPZ: {arr.files}")
-
-                    # timestamps
-                    for k in ("timestamps", "time_stamp", "times", "ts"):
-                        if k in arr.files:
-                            raw = arr[k]
-                            if raw.dtype.kind in ("S", "O"):
-                                timestamps = np.array([_to_text(v) for v in raw])
-                            else:
-                                timestamps = raw.astype(str)
-                            break
-
-                    # exposure
-                    for k in ("exposure_us", "exposure", "ExposureTime", "exp_us"):
-                        if k in arr.files:
-                            exposure = np.asarray(arr[k])
-                            break
-
-                    # temperature
-                    for k in ("temperature_chip", "ChipTemperature", "temperature", "temp"):
-                        if k in arr.files:
-                            temperature = np.asarray(arr[k])
-                            break
-
-                else:  # —— .npy
-                    npy = arr
-                    if npy.dtype.names:  # estructurado
-                        names = npy.dtype.names
-                        st.info(f"Campos en NPY estructurado: {names}")
-
-                        # timestamps
-                        for k in ("timestamps", "time_stamp", "timestamp", "ts"):
-                            if k in names:
-                                col = npy[k]
-                                timestamps = (np.array([_to_text(v) for v in col])
-                                              if col.dtype.kind in ("S","O") else col.astype(str))
-                                break
-                        # exposure
-                        for k in ("exposure_us", "exposure", "ExposureTime", "exp_us"):
-                            if k in names:
-                                exposure = np.asarray(npy[k])
-                                break
-                        # temperature
-                        for k in ("temperature_chip", "ChipTemperature", "temperature", "temp"):
-                            if k in names:
-                                temperature = np.asarray(npy[k])
-                                break
-                    else:
-                        # simple → asumimos timestamps
-                        flat = np.ravel(npy)
-                        timestamps = (np.array([_to_text(v) for v in flat])
-                                      if flat.dtype.kind in ("S","O") else flat.astype(str))
-
-                # —— Guardar y mostrar (sin afectar el resto del pipeline) ——
-                if timestamps is not None:
-                    st.session_state["timestamps"] = timestamps
-                    st.success(f"Timestamps cargados: {len(timestamps)}")
-                    st.dataframe(pd.DataFrame({"timestamp": timestamps[:20]}),
-                                 hide_index=True, use_container_width=True)
-                else:
-                    st.info("No encontré 'timestamps' en el archivo.")
-
-                if exposure is not None:
-                    st.session_state["exposure"] = exposure
-                    st.info(f"Exposure cargado: shape={np.shape(exposure)}, dtype={np.asarray(exposure).dtype}")
-                    st.dataframe(pd.DataFrame({"exposure_us": np.ravel(exposure)[:20]}),
-                                 hide_index=True, use_container_width=True)
-                else:
-                    st.info("No encontré 'exposure_us' en el archivo.")
-
-                if temperature is not None:
-                    st.session_state["temperature"] = temperature
-                    st.info(f"Temperature cargada: shape={np.shape(temperature)}, dtype={np.asarray(temperature).dtype}")
-                    st.dataframe(pd.DataFrame({"temperature_chip": np.ravel(temperature)[:20]}),
-                                 hide_index=True, use_container_width=True)
-                else:
-                    st.info("No encontré 'temperature_chip' en el archivo.")
-
-    # —— Return (no obliga a que existan exposure/temperature) ——
+    metadata = st.sidebar.file_uploader("📂 Upload CSV with metadata", type=".csv")
+    # Si el usuario subió algo, lo guardamos en session_state
+    if metadata is not None:
+        st.session_state["metadata"] = metadata
+    # Retornamos lo que se subió (sirve en este rerun)
     return (
         st.session_state.get('reflectance_stack', None),
-        st.session_state.get('original_tiff_paths', None),
-        st.session_state.get("timestamps", None),
-        st.session_state.get("exposure", None),
-        st.session_state.get("temperature", None),
+        st.session_state.get("metadata",None)
+        
     )
-
-
-
-
-
-def coefficients_show():
-    # Cargar archivo Excel
-    coefficients = pd.read_excel("ximea files/HbO2_Hb_spectrum_full.xlsx")
-    # Mostrar tabla dentro de un expander
-    with st.expander('Molar extinction coefficients', expanded=False):
-        st.dataframe(coefficients,hide_index=True)
-
-
 #load variables
 try:
-    reflectance_stack,original_stack,timestamps=folder_path_acquisition()
+    reflectance_stack,metadata=folder_path_acquisition()
 except:
-    st.info('Load both .npz and tiff files')
-
+    st.info('Load both .npz and metadata (.csv)')
 # Ends load variables
 
-
-def show_timestamps_panel(timestamps, reflectance_stack=None, original_tiff_paths=None):
-    st.subheader("Timestamps")
+def show_timestamps_panel(timestamps):
     if timestamps is None:
         st.info("No se han cargado timestamps todavía.")
         return
+    metadat_df=pd.read_csv(metadata)
+    with st.expander('Metadata'):
+        st.dataframe(metadat_df)
 
-    # Convertir a texto seguro
-    ts_txt = np.array([t.decode() if isinstance(t, (bytes, bytearray)) else str(t) for t in timestamps])
-    # Parsear a datetime si se puede
-    ts_dt = pd.to_datetime(ts_txt, errors="coerce")  # NaT si no se puede
-    df = pd.DataFrame({"timestamp": ts_txt, "parsed": ts_dt})
-
-    # Métricas básicas
-    n = len(df)
-    n_nat = df["parsed"].isna().sum()
-    st.write(f"Total: **{n}** entradas · Parseables: **{n - n_nat}** · No parseables: **{n_nat}**")
-
-    # Deltas (solo donde hay fecha válida y orden natural)
-    if n > 1 and n_nat < n:
-        # Chequeo de monotonicidad
-        mono = df["parsed"].is_monotonic_increasing if df["parsed"].notna().all() else False
-        if mono:
-            st.success("Orden temporal: Monótono creciente ✅")
-        else:
-            st.warning("Orden temporal: No monótono ⚠️ (hay empates o desorden)")
-
-        # Intervalos
-        dts = df["parsed"].diff().dt.total_seconds()
-        df["Δt [s]"] = dts
-
-        # Resumen de Δt
-        good = dts.dropna()
-        if not good.empty:
-            st.caption(
-                f"Δt (s) → min: {good.min():.6g} · p50: {good.median():.6g} · p95: {good.quantile(0.95):.6g} · max: {good.max():.6g}"
-            )
-
-            # Histograma simple con matplotlib
-            fig, ax = plt.subplots(figsize=(5, 2.8))
-            ax.hist(good.values, bins=min(50, max(5, int(np.sqrt(len(good))))))
-            ax.set_xlabel("Δt entre frames (s)")
-            ax.set_ylabel("Frecuencia")
-            ax.set_title("Distribución de intervalos")
-            st.pyplot(fig)
-
-    # Muestra rápida (cabezal y cola)
-    with st.expander("Ver tabla completa de timestamps", expanded=False):
-        st.dataframe(df, hide_index=True, use_container_width=True)
-
-    # Descarga CSV
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar timestamps como CSV", csv, "timestamps.csv", "text/csv")
-
-    # Cross-check con reflectance y TIFFs
-    if reflectance_stack is not None:
-        try:
-            I = reflectance_stack.shape[0]
-            if I == n:
-                st.success(f"Match con reflectance_stack: {I} frames = {n} timestamps ✅")
-            else:
-                st.error(f"Desajuste: reflectance_stack tiene {I} frames y timestamps {n} ⚠️")
-        except Exception:
-            st.info("No se pudo leer shape de reflectance_stack.")
-
-    if original_tiff_paths is not None:
-        m = len(original_tiff_paths)
-        if m == n:
-            st.success(f"Match con TIFFs: {m} imágenes = {n} timestamps ✅")
-        else:
-            st.warning(f"Desajuste con TIFFs: {m} imágenes vs {n} timestamps ⚠️")
-
+    
 #Band selection 
 def band_selection():
     # --- 1) Load wavelengts from XML ---
@@ -288,9 +81,14 @@ def band_selection():
     
     #Arranged from lower to maximum wavelengths
     wavelengths=np.sort(wavelengths)
+    df_wavelenght=pd.DataFrame({"Bands":range(16),"Wavelenght":wavelengths})
+    with st.expander("Bands wavelenghts"):
+        st.dataframe(df_wavelenght,hide_index=True)
 
     #load absorption coefficients HbO2 and Hb
     df_spec = pd.read_excel("ximea files/HbO2_Hb_spectrum_full.xlsx")
+    with st.expander('Molar extinction coefficients', expanded=False):
+        st.dataframe(df_spec,hide_index=True)
 
     # --- 3) Band selection interface ---
     with col2:
@@ -331,7 +129,6 @@ def band_selection():
     # Buscar coincidencia cercana a λ2
     match2 = df_spec[np.isclose(df_spec["lambda"], λ2, atol=2)]
    
-    # Si todo bien, accede
     row1 = match1.iloc[0]
     row2 = match2.iloc[0]
 
@@ -342,21 +139,27 @@ def band_selection():
     Hb_λ2   = row2['Hb']
     data=pd.DataFrame([{"HbO2-1":Hb02_λ1,"HbO2-2":Hb02_λ2, "Hb1": Hb_λ1, "Hb2":Hb_λ2}])
     st.dataframe(data,hide_index=True)
-   
+   # Matriz de coeficientes
     E = np.array([
         [Hb02_λ1, Hb_λ1],
         [Hb02_λ2, Hb_λ2]
     ])
-    print("Matriz E:\n", E)
-    print("Determinante:", np.linalg.det(E))
 
-    # --- 8) Matriz de extinción y determinante ---
-    E = np.array([
-        [Hb02_λ1, Hb_λ1],
-        [Hb02_λ2, Hb_λ2]
-    ])
+    # DataFrame con nombres
+    df_E = pd.DataFrame(E, columns=["HbO₂", "Hb"], index=["W1", "W2"])
+
+    # 👉 Nueva columna: diferencia (HbO₂ – Hb)
+    df_E["Δ(HbO₂-Hb)"] = df_E["HbO₂"] - df_E["Hb"]
+
+    # Mostrar en Streamlit
+    st.dataframe(df_E)
+
+    # Calcular determinante y número de condición
     det = np.linalg.det(E)
     condition_number = np.linalg.cond(E)
+
+    st.write(f"Determinante: {det:.4f}")
+    st.write(f"Número de condición: {condition_number:.4f}")
 
 
     if abs(det) < 0.01:
@@ -534,23 +337,20 @@ with col1:
     λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2=band_selection()
     run_calculations=st.button('Run calculations')
     if run_calculations:
-        beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack,original_stack,timestamps)
+        beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack)
         
 with col2:
-    st.empty()
+    show_timestamps_panel(
+        metadata)
 with col3:
-    coefficients_show()
+    
     st.subheader('Logs')
     if "logs" not in st.session_state:
         st.session_state.logs = []
     st.write(st.session_state.get("logs"))
 
-    # 👇 Añadir este visor:
-    show_timestamps_panel(
-        timestamps=st.session_state.get("timestamps"),
-        reflectance_stack=st.session_state.get("reflectance_stack"),
-        original_tiff_paths=st.session_state.get("original_tiff_paths")
-    )
+    
+
 
 
 
