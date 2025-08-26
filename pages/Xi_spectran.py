@@ -79,16 +79,16 @@ def band_selection():
     bands = sorted(root.findall(".//band"), key=lambda b: int(b.get("index", 0)))
     wavelengths = np.array([float(b.find("peaks/peak/wavelength_nm").text) for b in bands], dtype=np.float32)
     
-    #Arranged from lower to maximum wavelengths
-    wavelengths=np.sort(wavelengths)
-    df_wavelenght=pd.DataFrame({"Bands":range(16),"Wavelenght":wavelengths})
+    # Arranged from lower to maximum wavelengths
+    wavelengths = np.sort(wavelengths)
+    df_wavelenght = pd.DataFrame({"Bands": range(16), "Wavelenght": wavelengths})
     with st.expander("Bands wavelenghts"):
-        st.dataframe(df_wavelenght,hide_index=True)
+        st.dataframe(df_wavelenght, hide_index=True)
 
-    #load absorption coefficients HbO2 and Hb
+    # load absorption coefficients HbO2 and Hb
     df_spec = pd.read_excel("ximea files/HbO2_Hb_spectrum_full.xlsx")
     with st.expander('Molar extinction coefficients', expanded=False):
-        st.dataframe(df_spec,hide_index=True)
+        st.dataframe(df_spec, hide_index=True)
 
     # --- 3) Band selection interface ---
     with col2:
@@ -96,12 +96,16 @@ def band_selection():
     with col2:
         band2 = st.slider("Select band for Hb", min_value=0, max_value=15, value=5, step=1, key="band2_spec")
 
-    #Selection of wavelength in wavelengths with the sliders
+    # Evitar que elijan la misma banda (no hay separación)
+    if band1 == band2:
+        st.error("Selecciona dos bandas distintas. Con la misma banda no hay separación.")
+        return None, None, None, None, None, None, None, band1, band2
+
+    # Selection of wavelength in wavelengths with the sliders
     λ1 = int(wavelengths[band1])
     λ2 = int(wavelengths[band2])
 
-
-    # --- 5) Select wavelengths withing 400 and 700 nm ---
+    # --- 5) Select wavelengths within 450 and 650 nm ---
     df_zoom = df_spec[(df_spec["lambda"] >= 450) & (df_spec["lambda"] <= 650)]
 
     # --- 6) Graph with molar coefficients and selection of bands ---
@@ -122,61 +126,99 @@ def band_selection():
             ax.legend()
             st.pyplot(fig)
 
-
+    # --- 7) Tomar la fila más cercana a cada λ (si no hay match exacto) ---
     # Buscar coincidencia cercana a λ1
-    match1 = df_spec[np.isclose(df_spec["lambda"], λ1, atol=2)]
+    match1 = df_zoom[np.isclose(df_zoom["lambda"], λ1, atol=2)]
+    if match1.empty:
+        idx1 = (df_zoom["lambda"] - λ1).abs().idxmin()
+        row1 = df_zoom.loc[idx1]
+    else:
+        row1 = match1.iloc[0]
 
     # Buscar coincidencia cercana a λ2
-    match2 = df_spec[np.isclose(df_spec["lambda"], λ2, atol=2)]
-   
-    row1 = match1.iloc[0]
-    row2 = match2.iloc[0]
+    match2 = df_zoom[np.isclose(df_zoom["lambda"], λ2, atol=2)]
+    if match2.empty:
+        idx2 = (df_zoom["lambda"] - λ2).abs().idxmin()
+        row2 = df_zoom.loc[idx2]
+    else:
+        row2 = match2.iloc[0]
 
-    #acquire absorbance coefficients
-    Hb02_λ1 = row1['Hb02']
-    Hb_λ1   = row1['Hb']
-    Hb02_λ2 = row2['Hb02']
-    Hb_λ2   = row2['Hb']
-    data=pd.DataFrame([{"HbO2-1":Hb02_λ1,"HbO2-2":Hb02_λ2, "Hb1": Hb_λ1, "Hb2":Hb_λ2}])
-    st.dataframe(data,hide_index=True)
-   # Matriz de coeficientes
+    # --- 8) Acquire absorbance coefficients ---
+    Hb02_λ1 = float(row1['Hb02'])
+    Hb_λ1   = float(row1['Hb'])
+    Hb02_λ2 = float(row2['Hb02'])
+    Hb_λ2   = float(row2['Hb'])
+    data = pd.DataFrame([{"HbO2-1": Hb02_λ1, "HbO2-2": Hb02_λ2, "Hb1": Hb_λ1, "Hb2": Hb_λ2}])
+    st.dataframe(data, hide_index=True)
+
+    # --- 9) Matriz de coeficientes (para diagnóstico de condición) ---
     E = np.array([
         [Hb02_λ1, Hb_λ1],
         [Hb02_λ2, Hb_λ2]
-    ])
+    ], dtype=float)
 
-    # DataFrame con nombres
     df_E = pd.DataFrame(E, columns=["HbO₂", "Hb"], index=["W1", "W2"])
-
-    # 👉 Nueva columna: diferencia (HbO₂ – Hb)
     df_E["Δ(HbO₂-Hb)"] = df_E["HbO₂"] - df_E["Hb"]
-
-    # Mostrar en Streamlit
     st.dataframe(df_E)
 
-    # Calcular determinante y número de condición
-    det = np.linalg.det(E)
-    condition_number = np.linalg.cond(E)
+    # --- 10) MÉTRICA RATIO (Δε) INLINE: sin funciones auxiliares ---
+    # Diferencias absolutas
+    delta1 = Hb02_λ1 - Hb_λ1
+    delta2 = Hb02_λ2 - Hb_λ2
 
-    st.write(f"Determinante: {det:.4f}")
-    st.write(f"Número de condición: {condition_number:.4f}")
+    # Normalización local (escala dominante por λ)
+    scale1 = max(abs(Hb02_λ1), abs(Hb_λ1), 1e-12)
+    scale2 = max(abs(Hb02_λ2), abs(Hb_λ2), 1e-12)
+    rel1 = abs(delta1) / scale1
+    rel2 = abs(delta2) / scale2
 
+    # ¿Las diferencias tienen signos opuestos?
+    signs_opposite = (np.sign(delta1) != 0) and (np.sign(delta2) != 0) and (np.sign(delta1) != np.sign(delta2))
 
-    if abs(det) < 0.01:
-        st.warning(f"⚠️ Determinante muy bajo ({det:.4f}). Riesgo de inestabilidad numérica.")
-    elif abs(det) < 0.05:
-        st.info(f"ℹ️ Determinante moderado ({det:.4f}). Aceptable, pero con precaución.")
+    # Puntajes
+    score_mean = 0.5 * (rel1 + rel2)
+    score_geo  = float(np.sqrt(rel1 * rel2))
+
+    # Mostrar tabla compacta de la métrica
+    df_ratio = pd.DataFrame([{
+        "λ1 Δ(HbO₂−Hb)": delta1,
+        "λ1 Δ_rel": rel1,
+        "λ2 Δ(HbO₂−Hb)": delta2,
+        "λ2 Δ_rel": rel2,
+        "Signos opuestos": "Sí" if signs_opposite else "No",
+        "Score (media)": score_mean,
+        "Score (geom)": score_geo,
+    }])
+    st.dataframe(
+        df_ratio.style.format({
+            "λ1 Δ(HbO₂−Hb)": "{:.4g}", "λ1 Δ_rel": "{:.3f}",
+            "λ2 Δ(HbO₂−Hb)": "{:.4g}", "λ2 Δ_rel": "{:.3f}",
+            "Score (media)": "{:.3f}", "Score (geom)": "{:.3f}",
+        }),
+        hide_index=True
+    )
+
+    # --- 11) Diagnóstico de estabilidad: número de condición ---
+    condition_number = float(np.linalg.cond(E))
+    st.write(f"Número de condición: {condition_number:.2f}")
+
+    # --- 12) Semáforos (ajusta umbrales según tus datos reales) ---
+    # Semáforo de separación espectral
+    score = score_geo  # más exigente; usa score_mean si prefieres
+    if signs_opposite and score >= 0.30:
+        st.success(f"✅ Excelente separación espectral. Score={score:.3f} (signos opuestos).")
+    elif score >= 0.15:
+        st.info(f"ℹ️ Separación aceptable. Score={score:.3f}{' (signos opuestos)' if signs_opposite else ''}")
     else:
-        st.success(f"✅ Determinant adequate: {det:.4f}")
-    
+        st.warning(f"⚠️ Separación pobre. Score={score:.3f}. Prueba bandas más alejadas o cruza signo.")
+
+    # Semáforo de condición numérica
     if condition_number > 1000:
-        st.warning(f"⚠️ Alta inestabilidad numérica. Número de condición: {condition_number:.2f}")
+        st.warning(f"⚠️ Alta inestabilidad numérica. cond(E) = {condition_number:.2f}")
     elif condition_number > 100:
-        st.info(f"ℹ️ Condición moderada. Número de condición: {condition_number:.2f}")
+        st.info(f"ℹ️ Condición moderada. cond(E) = {condition_number:.2f}")
     else:
-        st.success(f"✅ Buena condición numérica: {condition_number:.2f}")
-
-
+        st.success(f"✅ Buena condición numérica: cond(E) = {condition_number:.2f}")
 
     return λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2
 
