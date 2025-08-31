@@ -105,11 +105,11 @@ def meta_data(b2nd):
     st.session_state["df_meta"]=df_meta
     st.dataframe(st.session_state.df_meta)
     csv = st.session_state.df_meta.to_csv(index=False).encode("utf-8")
-
+    date=datetime.now()
     st.download_button(
         label="📥 Download metadata (CSV)",
         data=csv,
-        file_name="metadata.csv",
+        file_name=f"metadata_{date}.csv",
         mime="text/csv"
     )
 
@@ -165,9 +165,17 @@ def demosaic_and_save(b2nd, dark_vec, white_vec):
     #Reorganize bands, will be used after reflectance calculations
     sort_idx = np.argsort(wavelengths_idx)     
 
-    #Output memmap 
+    
+    # Datos de ejemplo
     N, H, W = len(b2nd), *b2nd[0].shape
-    out_path = os.path.join(default, "reflectance.npy")
+
+    # Crear timestamp (ej: 2025-08-31_14-32-10)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Construir path con timestamp
+    out_path = os.path.join(default, f"reflectance_{timestamp}.npy")
+
+    # Crear memmap
     all_refl = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(N, 16, H//4, W//4))
 
     #Calculations and progress bar
@@ -207,7 +215,6 @@ def demosaic_and_save(b2nd, dark_vec, white_vec):
 
 
 
-
 def front_end():
     # Inicializa claves
     for key, default_val in [
@@ -232,6 +239,7 @@ def front_end():
         dark_med    = st.session_state.get("dark_median")
 
         if b2nd_loaded is not None and white_med is not None and dark_med is not None:
+
             st.session_state.b2nd_selected = True
             info_txt = getattr(b2nd_loaded, "info", None)
             st.session_state.logs.append(f"[{datetime.now():%H:%M:%S}] Loaded: {info_txt if info_txt else 'SChunk'}")

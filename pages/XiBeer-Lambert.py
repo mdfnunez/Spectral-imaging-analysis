@@ -6,10 +6,18 @@ import easygui
 import os
 import cv2
 import tifffile as tiff
+from tiffile import imwrite
 from bisect import bisect_right
 import xml.etree.ElementTree as ET
+from datetime import datetime
+
 
 st.set_page_config(layout="wide")
+
+#Desktop folder path
+global default
+default="/home/alonso/Desktop/"
+date=datetime.now()
 
 def header_agsantos():
     iol1, iol2 = st.columns([4, 1])
@@ -38,38 +46,28 @@ def folder_path_acquisition():
             if reflectance_stack.dtype == np.float64:
                 st.warning("Reflectance en float64. Convertiré por bloques a float32 si procesas todo.")
 
+            # Guardar en session_state
             st.session_state['reflectance_stack'] = reflectance_stack
+            st.session_state['reflectance_path'] = path
 
             if "logs" not in st.session_state:
                 st.session_state.logs = []
             st.session_state.logs.append(
                 f"✅ Reflectance (memmap) shape: {reflectance_stack.shape}, dtype: {reflectance_stack.dtype}"
             )
-    metadata = st.sidebar.file_uploader("📂 Upload CSV with metadata", type=".csv")
-    # Si el usuario subió algo, lo guardamos en session_state
-    if metadata is not None:
-        st.session_state["metadata"] = metadata
-    # Retornamos lo que se subió (sirve en este rerun)
-    return (
-        st.session_state.get('reflectance_stack', None),
-        st.session_state.get("metadata",None)
-        
-    )
+            st.sidebar.caption(st.session_state["reflectance_path"])
+            st.sidebar.caption(st.session_state["reflectance_stack"].shape)
+            # ← Return explícito
+            
+
+    # Si no se seleccionó nada, devuelve None
+    return st.session_state["reflectance_stack"]
 #load variables
 try:
-    reflectance_stack,metadata=folder_path_acquisition()
+    reflectance_stack=folder_path_acquisition()
 except:
-    st.info('Load both .npz and metadata (.csv)')
+    st.info('Load .npy file')
 # Ends load variables
-
-def show_timestamps_panel(timestamps):
-    if timestamps is None:
-        st.info("No se han cargado timestamps todavía.")
-        return
-    metadat_df=pd.read_csv(metadata)
-    with st.expander('Metadata'):
-        st.dataframe(metadat_df)
-
     
 #Band selection 
 def band_selection():
@@ -92,9 +90,9 @@ def band_selection():
 
     # --- 3) Band selection interface ---
     with col2:
-        band1 = st.slider("Select band for HbO₂", min_value=0, max_value=15, value=2, step=1, key="band1_spec")
+        band1 = st.slider("Select band for HbO₂", min_value=0, max_value=15, value=13, step=1, key="band1_spec")
     with col2:
-        band2 = st.slider("Select band for Hb", min_value=0, max_value=15, value=5, step=1, key="band2_spec")
+        band2 = st.slider("Select band for Hb", min_value=0, max_value=15, value=11, step=1, key="band2_spec")
 
     # Evitar que elijan la misma banda (no hay separación)
     if band1 == band2:
@@ -222,152 +220,127 @@ def band_selection():
 
     return λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2
 
-
-
-
-def beer_lambert_calculations(
-    λ1, λ2,
-    Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2,
-    E_unused,       # mantenido por compatibilidad, no se usa
-    band1, band2,
-    reflectance_stack,   # memmap/ndarray: (I, B, H, W) abierto con mmap_mode="r"
-    original_stack=None, # no usado aquí
-    timestamps=None,     # no usado aquí
-    block_size=8,
-    out_dir=None,        # si no es None, guarda memmaps: cHbO2, cHb, THb (como .npy)
-    mask_range=(1e-5, 3e-4)  # para el preview de máscara
+def mbll_2w_save_npy(
+    R,                 # reflectance_stack: (T, C, H, W)  float o uint16
+    band1, band2,      # índices de banda (λ1, λ2)
+    eps_HbO2_1, eps_Hb_1,   # ε en λ1
+    eps_HbO2_2, eps_Hb_2,   # ε en λ2
+    baseline_frames=60,
+    StO2_0=0.70,
+    DPF1=0.5, DPF2=0.5,
+    chunk_size=32      # nº de frames por bloque en el bucle
 ):
-    """
-    Opción A (segura): no modifica el archivo original y no sobrecarga la RAM.
-    - Lee el stack en streaming por bloques.
-    - Calcula rmax (1ª pasada).
-    - Calcula absorbancia y THb/cHbO2/cHb por bloques (2ª pasada).
-    - Si out_dir se especifica, guarda salidas en .npy (memmap) float32: (I,H,W).
-    - Devuelve un preview de THb[0] enmascarado para visualizar.
-    """
-    # ── 0) Streamlit opcional
-    try:
-        import streamlit as st
-        import matplotlib.pyplot as plt
-    except Exception:
-        class _Dummy:
-            def __getattr__(self, name): 
-                return lambda *a, **k: None
-        st = _Dummy()
-        # matplotlib solo si existe entorno gráfico; si no, no pasa nada.
+    
+    eps = 1e-8
+    T, C, H, W = R.shape
+    n = min(baseline_frames, T)
 
-    # ── 1) Shapes y matriz de extinción
-    I, B, H, W = reflectance_stack.shape
-    E = np.array([[Hb02_λ1, Hb_λ1],
-                  [Hb02_λ2, Hb_λ2]], dtype=np.float32)
+    # --- Baseline explícito (promedio primeros n frames por banda)
+    I01 = R[:n, band1].mean(axis=0, dtype=np.float64).astype(np.float32) + eps  # (H,W)
+    I02 = R[:n, band2].mean(axis=0, dtype=np.float64).astype(np.float32) + eps  # (H,W)
 
-    det = float(np.linalg.det(E))
-    cond = float(np.linalg.cond(E))
-    if abs(det) < 0.01:
-        st.warning(f"⚠️ Determinante muy bajo ({det:.4f}). Riesgo de inestabilidad.")
-    elif abs(det) < 0.05:
-        st.info(f"ℹ️ Determinante moderado ({det:.4f}). Úsalo con cautela.")
-    else:
-        st.success(f"✅ Determinante adecuado: {det:.4f}")
-    if cond > 1000:
-        st.warning(f"⚠️ Número de condición alto: {cond:.2f}")
-    elif cond > 100:
-        st.info(f"ℹ️ Condición moderada: {cond:.2f}")
-    else:
-        st.success(f"✅ Buena condición numérica: {cond:.2f}")
+    # --- Matriz E con DPF incluido e inversa cerrada (2x2)
+    a11 = DPF1 * eps_HbO2_1; a12 = DPF1 * eps_Hb_1
+    a21 = DPF2 * eps_HbO2_2; a22 = DPF2 * eps_Hb_2
+    det = a11*a22 - a12*a21
+    if abs(det) < 1e-12:
+        raise ValueError("Matriz mal condicionada (det≈0). Cambia λ1/λ2 o DPF.")
+    inv11 =  a22 / det; inv12 = -a12 / det
+    inv21 = -a21 / det; inv22 =  a11 / det
 
-    invE = np.linalg.inv(E).astype(np.float32, copy=False)
-    a, b = float(invE[0,0]), float(invE[0,1])
-    c, d = float(invE[1,0]), float(invE[1,1])
+    # --- Ancla basal para StO2 absoluta (tHb0=1)
+    HbO2_0 = float(StO2_0)
+    Hb_0   = float(1.0 - StO2_0)
 
-    # ── 2) PASADA 1: rmax por streaming (barra de progreso)
-    p1 = st.progress(0, text="Paso 1/2: Calculando rmax…")
-    rmax = None
-    for start in range(0, I, block_size):
-        end = min(start + block_size, I)
-        bmax = np.max(reflectance_stack[start:end])
-        rmax = bmax if rmax is None else max(rmax, bmax)
-        p1.progress(min(end / I, 1.0), text="Paso 1/2: Calculando rmax…")
-    rmax = np.float32(1.0 if rmax is None else rmax)
-    p1.empty()
-    st.caption(f"rmax (global): {float(rmax):.6g}")
+    # --- Crea archivos memmap de salida (evita usar RAM)
+    dHbO2_mm   = np.lib.format.open_memmap(f"{default}_dHbO2.npy", mode='w+', dtype=np.float32, shape=(T, H, W))
+    dHb_mm     = np.lib.format.open_memmap(f"{default}_dHb.npy",   mode='w+', dtype=np.float32, shape=(T, H, W))
+    StO2_mm    = np.lib.format.open_memmap(f"{default}_StO2.npy",  mode='w+', dtype=np.float32, shape=(T, H, W))
+    StO2mean_mm= np.lib.format.open_memmap(f"{default}_StO2_mean.npy", mode='w+', dtype=np.float32, shape=(T,))
 
-    # ── 3) Salidas como memmap .npy (solo si se solicitó)
-    mm_cHbO2 = mm_cHb = mm_THb = None
-    if out_dir is not None:
-        os.makedirs(out_dir, exist_ok=True)
-        mm_cHbO2 = open_memmap(os.path.join(out_dir, "cHbO2.npy"), mode="w+", dtype=np.float32, shape=(I, H, W))
-        mm_cHb   = open_memmap(os.path.join(out_dir, "cHb.npy"),   mode="w+", dtype=np.float32, shape=(I, H, W))
-        mm_THb   = open_memmap(os.path.join(out_dir, "THb.npy"),   mode="w+", dtype=np.float32, shape=(I, H, W))
+    # --- Procesa por bloques en T
+    for t0 in range(0, T, chunk_size):
+        t1 = min(t0 + chunk_size, T)
 
-    # ── 4) PASADA 2: procesamiento por bloques (buffer escribible) + barra
-    p2 = st.progress(0, text="Paso 2/2: Procesando por bloques…")
-    preview_thb0 = None
-    lo, hi = mask_range
+        I1 = R[t0:t1, band1].astype(np.float32)    # (B,H,W)
+        I2 = R[t0:t1, band2].astype(np.float32)    # (B,H,W)
 
-    for start in range(0, I, block_size):
-        end = min(start + block_size, I)
+        # ΔOD = -ln(I/I0), con clip de seguridad
+        dOD1 = -np.log(np.clip(I1 / I01, eps, None))
+        dOD2 = -np.log(np.clip(I2 / I02, eps, None))
 
-        # Buffer escribible en float32
-        src  = reflectance_stack[start:end]               # (n,B,H,W) read-only
-        buf  = np.array(src, dtype=np.float32, copy=True) # (n,B,H,W) escribible
+        # x = E^{-1} y  (vectorizado)
+        dHbO2_blk = inv11 * dOD1 + inv12 * dOD2     # (B,H,W)
+        dHb_blk   = inv21 * dOD1 + inv22 * dOD2     # (B,H,W)
 
-        # Normalización + clipping in-place
-        buf /= rmax
-        np.clip(buf, 1e-2, 1.0, out=buf)
+        # StO2(t) con ancla basal
+        HbO2_t = HbO2_0 + dHbO2_blk
+        Hb_t   = Hb_0   + dHb_blk
+        tHb_t  = np.clip(HbO2_t + Hb_t, eps, None)
+        StO2_blk = np.clip(HbO2_t / tHb_t, 0.0, 1.0)
 
-        # Absorbancia in-place: -log(buf)
-        np.log(buf, out=buf)
-        buf *= -1.0
+        # Guarda al memmap
+        dHbO2_mm[t0:t1] = dHbO2_blk
+        dHb_mm[t0:t1]   = dHb_blk
+        StO2_mm[t0:t1]  = StO2_blk
+        StO2mean_mm[t0:t1] = StO2_blk.reshape(t1 - t0, -1).mean(axis=1)
 
-        # Bandas
-        A1 = buf[:, band1, :, :]
-        A2 = buf[:, band2, :, :]
+        # opcional: asegura flush del bloque (útil en procesos largos)
+        dHbO2_mm.flush(); dHb_mm.flush(); StO2_mm.flush(); StO2mean_mm.flush()
 
-        # Combinaciones lineales
-        cHbO2_blk = a * A1 + b * A2
-        cHb_blk   = c * A1 + d * A2
-        THb_blk   = cHbO2_blk + cHb_blk
+def _to_uint16(img):
+    # autocontraste simple por frame
+    lo = np.nanmin(img)
+    hi = np.nanmax(img)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros_like(img, dtype=np.uint16)
+    img = (img - lo) / (hi - lo + 1e-12)
+    return (img * 65535).astype(np.uint16)
 
-        # Escribir a disco si procede
-        if mm_THb is not None:
-            mm_cHbO2[start:end] = cHbO2_blk
-            mm_cHb[start:end]   = cHb_blk
-            mm_THb[start:end]   = THb_blk
-            mm_cHbO2.flush(); mm_cHb.flush(); mm_THb.flush()
+def tiffiles_export(reflectance_stack, default_dir="/home/alonso/Desktop"):
+    with st.expander("Download tiffiles"):
+        gen_tiff = st.button("Generate all TIFFs")
+        n, c, h, w = reflectance_stack.shape
+        st.write(f"Frames encontrados: {n}, canales: {c}")
 
-        # Primer frame para preview
-        if preview_thb0 is None:
-            thb0 = THb_blk[0]  # (H,W)
-            mask = (thb0 > lo) & (thb0 < hi)
-            preview_thb0 = np.where(mask, thb0, np.nan).astype(np.float32, copy=False)
+        if gen_tiff:
+            # carpeta con timestamp
+            date = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_dir = os.path.join(default_dir, f"TIFFs_{date}")
+            out_gray = os.path.join(out_dir, "grayscale")
+            out_rgb  = os.path.join(out_dir, "rgb")
+            os.makedirs(out_gray, exist_ok=True)
+            os.makedirs(out_rgb, exist_ok=True)
 
-        # liberar refs
-        del cHbO2_blk, cHb_blk, THb_blk, A1, A2, buf, src
+            # --- Export GRAYSCALE (canal 0, 16-bit) ---
+            for i in range(n):
+                img = reflectance_stack[i, 0, :, :]   # frame i, canal 0 (ajusta si quieres otro)
+                img_u16 = _to_uint16(img)
+                out_path = os.path.join(out_gray, f"frame_{i:04d}.tif")
+                imwrite(out_path, img_u16, photometric="minisblack")
 
-        p2.progress(min(end / I, 1.0), text="Paso 2/2: Procesando por bloques…")
-    p2.empty()
+            # --- Export RGB (elige 3 canales; aquí 3,7,12 a modo de ejemplo) ---
+            R_idx, G_idx, B_idx = 15, 10, 0  # cámbialos a tus bandas favoritas
+            for i in range(n):
+                r = reflectance_stack[i, R_idx, :, :]
+                g = reflectance_stack[i, G_idx, :, :]
+                b = reflectance_stack[i, B_idx, :, :]
 
-    # ── 5) Visualización: matriz E y preview de THb[0]
-    st.caption('Matriz de coeficientes de extinción (E)')
-    st.dataframe(E)
-    if preview_thb0 is not None:
-        fig, ax = plt.subplots()
-        cax = ax.imshow(preview_thb0, cmap='inferno', vmin=0, vmax=float(hi))
-        fig.colorbar(cax, ax=ax)
-        ax.set_title("THb[0] enmascarado")
-        st.pyplot(fig)
+                # normalización conjunta para mantener el color
+                rgb = np.stack([r, g, b], axis=-1)   # (H, W, 3)
+                lo = np.nanmin(rgb)
+                hi = np.nanmax(rgb)
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    rgb_u16 = np.zeros_like(rgb, dtype=np.uint16)
+                else:
+                    rgb_n = (rgb - lo) / (hi - lo + 1e-12)
+                    rgb_u16 = (np.clip(rgb_n, 0, 1) * 65535).astype(np.uint16)
 
-    return {
-        "determinant": det,
-        "condition_number": cond,
-        "rmax": float(rmax),
-        "preview_masked_THb0": preview_thb0,   # (H,W) float32 con NaNs fuera de rango
-        "outputs_dir": out_dir,
-        "shapes": {"I": I, "B": B, "H": H, "W": W}
-    }
+                out_path = os.path.join(out_rgb, f"frame_{i:04d}.tif")
+                # OJO: photometric="rgb" para color
+                imwrite(out_path, rgb_u16, photometric="rgb")  # visores normales lo leen bien
 
-
+            st.success(f"{n} TIFFs guardados en:\n{out_dir}")
 
 
 
@@ -377,15 +350,14 @@ def beer_lambert_calculations(
 col1,col2,col3=st.columns([1,1,0.5])
 with col1:
     λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2=band_selection()
-    run_calculations=st.button('Run calculations')
-    if run_calculations:
-        beer_lambert_calculations(λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2,reflectance_stack)
-        
+    run_calculations=st.toggle('Run calculations')
+    if run_calculations and reflectance_stack is not None:
+        mbll_2w_save_npy(reflectance_stack,band1,band2,Hb02_λ1,Hb_λ1,Hb02_λ2,Hb_λ2)
+    elif run_calculations and reflectance_stack is None:
+        st.warning("Load reflectance stack")
 with col2:
-    show_timestamps_panel(
-        metadata)
+    tiffiles_export(reflectance_stack)
 with col3:
-    
     st.subheader('Logs')
     if "logs" not in st.session_state:
         st.session_state.logs = []
