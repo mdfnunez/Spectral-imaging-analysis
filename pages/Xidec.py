@@ -14,6 +14,7 @@ import os, json
 st.set_page_config('Xidec',layout="wide")
 st.title('Xidec')
 st.caption('Software for decompression of .b2nd files from the Xilens program')
+st.info('The output reflectance_date.npy file has its bands reordered in an ascendent fashion band 0= 460 nm, band 15=594 nm, sensor response and black and white calculations')
 
 # Paths (Change paths to local PC if needed)
 global default

@@ -68,7 +68,27 @@ try:
 except:
     st.info('Load .npy file')
 # Ends load variables
-    
+
+
+def reflectance_visualization(reflectance_stack):
+    with st.expander('Visualization of reflectance images'):
+        n,c,h,w=reflectance_stack.shape
+        select_image=st.slider('Select image',0,n-1,step=1)
+        select_band=st.slider("Select band",0,c-1)
+        image = reflectance_stack[select_image, select_band, :, :]  # (ej: primer frame, primer canal)
+        
+        fig, ax = plt.subplots()
+        im_clean = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+        vmin = np.percentile(im_clean, 2)
+        vmax = np.percentile(im_clean, 98)
+
+        im = ax.imshow(image, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.axis("off")  # oculta ejes si quieres
+        
+        st.pyplot(fig)
+
+
+reflectance_visualization(reflectance_stack)
 #Band selection 
 def band_selection():
     # --- 1) Load wavelengts from XML ---
@@ -79,8 +99,8 @@ def band_selection():
     
     # Arranged from lower to maximum wavelengths
     wavelengths = np.sort(wavelengths)
-    df_wavelenght = pd.DataFrame({"Bands": range(16), "Wavelenght": wavelengths})
-    with st.expander("Bands wavelenghts"):
+    df_wavelenght = pd.DataFrame({"Bands": range(len(wavelengths)), "Wavelength": wavelengths})
+    with st.expander("Bands wavelengths"):
         st.dataframe(df_wavelenght, hide_index=True)
 
     # load absorption coefficients HbO2 and Hb
@@ -146,8 +166,6 @@ def band_selection():
     Hb_λ1   = float(row1['Hb'])
     Hb02_λ2 = float(row2['Hb02'])
     Hb_λ2   = float(row2['Hb'])
-    data = pd.DataFrame([{"HbO2-1": Hb02_λ1, "HbO2-2": Hb02_λ2, "Hb1": Hb_λ1, "Hb2": Hb_λ2}])
-    st.dataframe(data, hide_index=True)
 
     # --- 9) Matriz de coeficientes (para diagnóstico de condición) ---
     E = np.array([
@@ -240,9 +258,12 @@ def mbll_2w_save_npy(
     I02 = R[:n, band2].mean(axis=0, dtype=np.float64).astype(np.float32) + eps  # (H,W)
 
     # --- Matriz E con DPF incluido e inversa cerrada (2x2)
-    a11 = DPF1 * eps_HbO2_1; a12 = DPF1 * eps_Hb_1
-    a21 = DPF2 * eps_HbO2_2; a22 = DPF2 * eps_Hb_2
+    a11 = DPF1 * eps_HbO2_1
+    a12 = DPF1 * eps_Hb_1
+    a21 = DPF2 * eps_HbO2_2
+    a22 = DPF2 * eps_Hb_2
     det = a11*a22 - a12*a21
+
     if abs(det) < 1e-12:
         raise ValueError("Matriz mal condicionada (det≈0). Cambia λ1/λ2 o DPF.")
     inv11 =  a22 / det; inv12 = -a12 / det
@@ -288,61 +309,117 @@ def mbll_2w_save_npy(
         # opcional: asegura flush del bloque (útil en procesos largos)
         dHbO2_mm.flush(); dHb_mm.flush(); StO2_mm.flush(); StO2mean_mm.flush()
 
-def _to_uint16(img):
-    # autocontraste simple por frame
-    lo = np.nanmin(img)
-    hi = np.nanmax(img)
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return np.zeros_like(img, dtype=np.uint16)
-    img = (img - lo) / (hi - lo + 1e-12)
-    return (img * 65535).astype(np.uint16)
 
-def tiffiles_export(reflectance_stack, default_dir="/home/alonso/Desktop"):
-    with st.expander("Download tiffiles"):
-        gen_tiff = st.button("Generate all TIFFs")
-        n, c, h, w = reflectance_stack.shape
-        st.write(f"Frames encontrados: {n}, canales: {c}")
+def _auto_vmin_vmax_joint(rgb, p_low=2, p_high=98, ignore_zeros=True):
+    """
+    Calcula vmin/vmax conjuntos para un stack RGB (H,W,3) usando percentiles robustos.
+    Mantiene la relación entre canales (fidelidad de color).
+    """
+    a = np.asarray(rgb, dtype=np.float32)
+    # aplanar canales juntos
+    flat = a.reshape(-1, a.shape[-1])
+    flat = flat[np.all(np.isfinite(flat), axis=1)]  # filas sin NaNs/Inf
+    if flat.size == 0:
+        return 0.0, 1.0
+    vals = flat.reshape(-1)  # mezcla R,G,B en un vector
+    if ignore_zeros:
+        vals = vals[vals > 0]
+        if vals.size == 0:
+            return 0.0, 1.0
+    vmin = float(np.percentile(vals, p_low))
+    vmax = float(np.percentile(vals, p_high))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin = float(np.min(vals)); vmax = float(np.max(vals))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmax = vmin + 1e-6
+    return vmin, vmax
 
-        if gen_tiff:
-            # carpeta con timestamp
-            date = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = os.path.join(default_dir, f"TIFFs_{date}")
-            out_gray = os.path.join(out_dir, "grayscale")
-            out_rgb  = os.path.join(out_dir, "rgb")
-            os.makedirs(out_gray, exist_ok=True)
-            os.makedirs(out_rgb, exist_ok=True)
+def _to_uint16_joint(rgb, vmin=None, vmax=None, gamma=0.8, ignore_zeros=True):
+    """
+    Normaliza RGB -> [0,1] con vmin/vmax conjuntos, aplica gamma común y pasa a uint16.
+    rgb: (H, W, 3) float.
+    """
+    im = np.nan_to_num(rgb, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if vmin is None or vmax is None:
+        vmin, vmax = _auto_vmin_vmax_joint(im, p_low=2, p_high=98, ignore_zeros=ignore_zeros)
+    norm = (im - vmin) / (vmax - vmin + 1e-12)
+    norm = np.clip(norm, 0.0, 1.0)
+    if abs(gamma - 1.0) > 1e-6:
+        norm = np.power(norm, 1.0/gamma)
+    return (norm * 65535.0 + 0.5).astype(np.uint16)
 
-            # --- Export GRAYSCALE (canal 0, 16-bit) ---
-            for i in range(n):
-                img = reflectance_stack[i, 0, :, :]   # frame i, canal 0 (ajusta si quieres otro)
-                img_u16 = _to_uint16(img)
-                out_path = os.path.join(out_gray, f"frame_{i:04d}.tif")
-                imwrite(out_path, img_u16, photometric="minisblack")
+def _to_uint16_gray(img, p_low=2, p_high=98, gamma=1.0, ignore_zeros=True):
+    """
+    Escala robusta por percentiles para una imagen gris (H,W).
+    """
+    im = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    vals = im[np.isfinite(im)]
+    if ignore_zeros:
+        vals = vals[vals > 0]
+    if vals.size == 0:
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin = float(np.percentile(vals, p_low))
+        vmax = float(np.percentile(vals, p_high))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin = float(np.min(vals)); vmax = float(np.max(vals))
+            if vmax <= vmin:
+                vmax = vmin + 1e-6
+    norm = (im - vmin) / (vmax - vmin + 1e-12)
+    norm = np.clip(norm, 0.0, 1.0)
+    if abs(gamma - 1.0) > 1e-6:
+        norm = np.power(norm, 1.0/gamma)
+    return (norm * 65535.0 + 0.5).astype(np.uint16)
 
-            # --- Export RGB (elige 3 canales; aquí 3,7,12 a modo de ejemplo) ---
-            R_idx, G_idx, B_idx = 15, 10, 0  # cámbialos a tus bandas favoritas
-            for i in range(n):
-                r = reflectance_stack[i, R_idx, :, :]
-                g = reflectance_stack[i, G_idx, :, :]
-                b = reflectance_stack[i, B_idx, :, :]
+# ---------- Exportador con fidelidad (normalización conjunta) ----------
 
-                # normalización conjunta para mantener el color
-                rgb = np.stack([r, g, b], axis=-1)   # (H, W, 3)
-                lo = np.nanmin(rgb)
-                hi = np.nanmax(rgb)
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    rgb_u16 = np.zeros_like(rgb, dtype=np.uint16)
-                else:
-                    rgb_n = (rgb - lo) / (hi - lo + 1e-12)
-                    rgb_u16 = (np.clip(rgb_n, 0, 1) * 65535).astype(np.uint16)
+def tiffiles_export(reflectance_stack, out_root="/home/alonso/Desktop"):
+    """
+    Exporta TIFFs manteniendo fidelidad espectral:
+      - GRAYSCALE: canal fijo (GRAY_CH) con percentiles 2–98 y gamma común.
+      - RGB: canales (R_idx,G_idx,B_idx) con normalización CONJUNTA (vmin/vmax) y gamma común.
+    Asume reflectance_stack shape = (T, C, H, W), ordenado por λ ascendente.
+    """
+    if reflectance_stack is None:
+        raise ValueError("reflectance_stack es None.")
+    T, C, H, W = reflectance_stack.shape
+    if C < 3:
+        raise ValueError(f"Se requieren ≥3 canales para RGB. C={C}")
 
-                out_path = os.path.join(out_rgb, f"frame_{i:04d}.tif")
-                # OJO: photometric="rgb" para color
-                imwrite(out_path, rgb_u16, photometric="rgb")  # visores normales lo leen bien
+    # Configuración fija (ajusta si quieres otros índices)
+    GRAY_CH = 0                 # canal para escala de grises
+    R_idx, G_idx, B_idx = 15, 10, 0
+    GAMMA_GRAY = 0.8
+    GAMMA_RGB  = 0.8
+    IGNORE_ZEROS = True
 
-            st.success(f"{n} TIFFs guardados en:\n{out_dir}")
+    # Carpeta de salida
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(out_root, f"TIFFs_fidelidad_{stamp}")
+    out_gray = os.path.join(out_dir, "grayscale")
+    out_rgb  = os.path.join(out_dir, "rgb")
+    os.makedirs(out_gray, exist_ok=True)
+    os.makedirs(out_rgb, exist_ok=True)
 
+    # --- Export GRAYSCALE ---
+    for i in range(T):
+        img = reflectance_stack[i, GRAY_CH]  # (H,W)
+        img_u16 = _to_uint16_gray(img, p_low=2, p_high=98, gamma=GAMMA_GRAY, ignore_zeros=IGNORE_ZEROS)
+        imwrite(os.path.join(out_gray, f"frame_{i:04d}.tif"), img_u16, photometric="minisblack")
 
+    # --- Export RGB (normalización conjunta → fidelidad) ---
+    for i in range(T):
+        r = reflectance_stack[i, R_idx]
+        g = reflectance_stack[i, G_idx]
+        b = reflectance_stack[i, B_idx]
+        rgb = np.stack([r, g, b], axis=-1)  # (H,W,3) float
+
+        rgb_u16 = _to_uint16_joint(rgb, gamma=GAMMA_RGB, ignore_zeros=IGNORE_ZEROS)
+        imwrite(os.path.join(out_rgb, f"frame_{i:04d}.tif"), rgb_u16, photometric="rgb")
+
+    return out_dir
 
 
 
@@ -350,13 +427,13 @@ def tiffiles_export(reflectance_stack, default_dir="/home/alonso/Desktop"):
 col1,col2,col3=st.columns([1,1,0.5])
 with col1:
     λ1, λ2, Hb02_λ1, Hb_λ1, Hb02_λ2, Hb_λ2, E, band1, band2=band_selection()
-    run_calculations=st.toggle('Run calculations')
+    run_calculations=st.button('Run calculations and export files')
     if run_calculations and reflectance_stack is not None:
         mbll_2w_save_npy(reflectance_stack,band1,band2,Hb02_λ1,Hb_λ1,Hb02_λ2,Hb_λ2)
+        tiffiles_export(reflectance_stack)
     elif run_calculations and reflectance_stack is None:
         st.warning("Load reflectance stack")
-with col2:
-    tiffiles_export(reflectance_stack)
+ 
 with col3:
     st.subheader('Logs')
     if "logs" not in st.session_state:
