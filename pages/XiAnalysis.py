@@ -4,7 +4,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 import easygui
-from bisect import bisect_right
 from tifffile import imread as imread_tiff
 import cv2
 from PIL import Image, ImageTk
@@ -14,7 +13,7 @@ import tiffile as tiff
 import glob
 
 
-DEFAULT_DIR = "/home/alonso/Desktop/"
+default = "/home/alonso/Desktop/"
 st.set_page_config(layout="wide")
 
 # --- Header ---
@@ -37,7 +36,7 @@ def folder_path_acquisition():
     if st.sidebar.button('Add processed stack .npy file'):
         path = easygui.fileopenbox(
             msg="Select a .npy file with processed stacks",
-            default=DEFAULT_DIR,
+            default=default,
             filetypes=["*.npy"]
         )
         if path:
@@ -50,7 +49,7 @@ def folder_path_acquisition():
             st.session_state['processed_keys'] = ['Index']
 
     if st.sidebar.button('Add TIFF folder'):
-        tiff_dir_path = easygui.diropenbox("Select folder with TIFF frames", default=DEFAULT_DIR)
+        tiff_dir_path = easygui.diropenbox("Select folder with TIFF frames", default=default)
         if tiff_dir_path:
             tiff_files = sorted(
                 [os.path.join(tiff_dir_path, f) for f in os.listdir(tiff_dir_path)
@@ -73,68 +72,78 @@ def folder_path_acquisition():
     # Metadata CSV -> log_map
     metadata_file = st.sidebar.file_uploader("📂 Upload CSV metadata (Timestamp,log_event)", type=".csv")
     if metadata_file is not None:
-        df_meta = pd.read_csv(metadata_file)
-        if not {'Timestamp', 'log_event'}.issubset(df_meta.columns):
-            st.error("CSV must contain columns: Timestamp, log_event")
-        else:
-            st.session_state['metadata'] = df_meta
-            st.session_state['log_map'] = dict(zip(df_meta['Timestamp'].astype(str),
-                                                   df_meta['log_event'].astype(str)))
-
+        metadata=pd.read_csv(metadata_file)
+        st.session_state["metadata"]=metadata
     return (
-        st.session_state.get('processed_stack'),
-        st.session_state.get('metadata'),
-        st.session_state.get('tiff_path')
+        st.session_state.get('processed_stack',None),
+        st.session_state.get('metadata',None),
+        st.session_state.get('tiff_path',None)
     )
 
-def processed_visualizer(processed_stack,tiff_folder):
-    col1,col2,col3=st.columns([1,2,2])
-    #Processed data mask
+def processed_visualizer(processed_stack, tiff_folder):
+    col1, col2= st.columns([0.5, 2])
     with col1:
-        st.sidebar.info(f"Shape of stack: {processed_stack.shape}")
-        n,h,w=processed_stack.shape 
-        num_images=st.slider('Select image',0,max_value=n-1) 
-    img=processed_stack[num_images,:,:] 
-    fig,ax=plt.subplots() 
-    vmin=np.percentile(img,20) 
-    vmax=np.percentile(img,80) 
-    im=ax.imshow(img,cmap="coolwarm",vmin=vmin,vmax=vmax) 
-    with col2:
-        st.pyplot(fig)
-        st.caption('Processed stack image')
+        view_mode = st.selectbox(
+        "Ver:",
+        ["Superimposed","Processed", "Original"] 
+    )
 
-    ##Tiffile
+        n, h, w = processed_stack.shape
+        num_images = st.slider('Select image', 0, max_value=n - 1)
+
+    # --- Procesado ---
+    img_proc = processed_stack[num_images, :, :]
+    fig_proc, ax_proc = plt.subplots()
+    vmin = np.percentile(img_proc, 20)
+    vmax = np.percentile(img_proc, 80)
+    ax_proc.imshow(img_proc, cmap="coolwarm", vmin=vmin, vmax=vmax)
+
+    # --- Tiffile (original) ---
     tiff_files = sorted(glob.glob(os.path.join(tiff_folder, "*.tif")))
-    st.session_state["tiff_files"]=tiff_files
+    st.session_state["tiff_files"] = tiff_files
+    img_tiff = tiff.imread(tiff_files[num_images])
 
-    img_tiff=tiff.imread(tiff_files[num_images])
-    with col3:
-        if img_tiff.ndim==2:
-            fig,ax=plt.subplots()
-            vmin=np.percentile(img_tiff,2)
-            vmax=np.percentile(img_tiff,98)
-            ax.imshow(img_tiff,vmin=vmin,vmax=vmax, cmap="gray")
-            st.pyplot(fig)
-            st.caption('Grayscale image')
+    if img_tiff.ndim == 2:
+        fig_orig, ax_orig = plt.subplots()
+        vmin = np.percentile(img_tiff, 2)
+        vmax = np.percentile(img_tiff, 98)
+        ax_orig.imshow(img_tiff, vmin=vmin, vmax=vmax, cmap="gray")
+    elif img_tiff.ndim == 3:
+        rgb = img_tiff[:, :, :3].astype(np.float32)
+        p2, p98 = np.percentile(rgb[np.isfinite(rgb)], (2, 98))
+        rgb_disp = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
+        fig_orig, ax_orig = plt.subplots()
+        ax_orig.imshow(rgb_disp)
 
-        elif img_tiff.ndim == 3:
-            rgb = img_tiff[:,:,:3]                # (H, W, 3)
-            rgb = rgb.astype(np.float32)
-            p2, p98 = np.percentile(rgb[np.isfinite(rgb)], (2, 98))
-            rgb_disp = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
-            st.image(rgb_disp)   
-            st.caption('RGB image')
-    return st.session_state["tiff_files"]
+    # --- Mostrar según el modo ---
+    with col2:
+        if view_mode == "Processed":
+            st.pyplot(fig_proc)
+            st.caption("Processed stack image")
+        elif view_mode == "Original":
+            st.pyplot(fig_orig)
+            st.caption("Original TIFF image")
+        elif view_mode == "Superimposed":
+            fig_overlay, ax_overlay = plt.subplots()
 
+            # Fondo TIFF
+            if img_tiff.ndim == 2:
+                ax_overlay.imshow(img_tiff, cmap="gray")
+            else:
+                ax_overlay.imshow(rgb_disp)
 
-def normalize_img(img, p1=1, p99=99):
-    """Escala imagen a 8-bit con percentiles."""
-    img = img.astype(np.float32)
-    lo, hi = np.percentile(img, (p1, p99))
-    img = np.clip(img, lo, hi)
-    return (255 * (img - lo) / (hi - lo + 1e-5)).astype(np.uint8)
+            # Mismo vmin/vmax que la vista "Procesado"
+            vmin = np.percentile(img_proc, 20)
+            vmax = np.percentile(img_proc, 80)
 
-def tracking_roi_selector(tiff_files, processed_stack, scale=3, output_video='tracking_output.avi'):
+            # Procesado con máscara de blancos
+            img_masked = np.ma.masked_where(img_proc > 0.9, img_proc)
+            ax_overlay.imshow(img_masked, cmap="coolwarm", vmin=vmin, vmax=vmax, alpha=0.7)
+
+            st.pyplot(fig_overlay)
+            st.caption("Overlay con mismos límites de intensidad")
+        return tiff_files
+def tracking_roi_selector(tiff_files, processed_stack,metadata, scale=3, output_video='tracking_output.avi'):
     if st.button("Select ROIs & Track"):
         # --- Primer frame para selección de ROI ---
         img0 = tiff.imread(tiff_files[0])
@@ -143,7 +152,6 @@ def tracking_roi_selector(tiff_files, processed_stack, scale=3, output_video='tr
 
         img0n = normalize_img(img0)
         H, W = img0n.shape
-        st.write("First frame shape:", img0n.shape)
 
         pil_img = Image.fromarray(img0n).resize((W*scale, H*scale))
         rois_local, use_global_percentile = [], True
@@ -227,10 +235,20 @@ def tracking_roi_selector(tiff_files, processed_stack, scale=3, output_video='tr
         st.success(f"✅ Tracking done. Video saved as: {video_name}")
         st.session_state["roi_tracks"] = roi_tracks
         st.session_state["video_file"] = video_name
+        compute_mean_in_tracked_rois(processed_stack,roi_tracks,metadata)
+        return roi_tracks
+
+def normalize_img(img, p1=1, p99=99):
+    """Escala imagen a 8-bit con percentiles."""
+    img = img.astype(np.float32)
+    lo, hi = np.percentile(img, (p1, p99))
+    img = np.clip(img, lo, hi)
+    return (255 * (img - lo) / (hi - lo + 1e-5)).astype(np.uint8)
 
 
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None):
+    import io
 
-def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
     height, width = processed_stack.shape[1:]
     rows = []
 
@@ -241,11 +259,59 @@ def compute_mean_in_tracked_rois(processed_stack, roi_tracks):
             x1, x2 = max(0, x), min(x + w, width)
             roi_data = processed_stack[frame_id][y1:y2, x1:x2]
             mean_val = float(np.nanmean(roi_data)) if roi_data.size > 0 else None
-            if np.isnan(mean_val): mean_val = None
+            if np.isnan(mean_val):
+                mean_val = None
 
+            rows.append({
+                "frame": frame_id,
+                "roi_name": name,
+                "mean_value": mean_val
+            })
 
-    df = pd.DataFrame(rows)
-    return df.pivot(index=['frame', 'log_event'], columns='roi_name', values='mean_value').reset_index()
+    # --- DataFrame largo
+    df_long = pd.DataFrame(rows)
+
+    # --- Convertir a ancho → cada ROI es una columna
+    df_wide = df_long.pivot(index="frame", columns="roi_name", values="mean_value").reset_index()
+
+    # --- Mostrar tabla
+    st.write("📊 Intensidad media en ROIs:")
+    st.dataframe(df_wide)
+
+    # --- Gráfica dinámica con todas las columnas
+    if len(df_wide.columns) > 1:  # hay al menos frame + 1 ROI
+        st.line_chart(df_wide.set_index("frame"))
+    else:
+        st.warning("⚠️ No se encontraron ROIs para graficar.")
+
+    # --- Si hay metadata, unir
+    df_final = df_wide
+    if metadata is not None:
+        try:
+            if not isinstance(metadata, pd.DataFrame):
+                metadata = pd.read_csv(metadata)
+
+            if "frame" in metadata.columns:
+                df_final = df_wide.merge(metadata, on="frame", how="left")
+            else:
+                df_final = pd.concat([df_wide, metadata], axis=1)
+
+            st.write("📊 Datos con metadata añadida:")
+            st.dataframe(df_final)
+        except Exception as e:
+            st.error(f"Error leyendo metadata: {e}")
+
+    # --- Botón de descarga
+    csv_buffer = io.StringIO()
+    df_final.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="📥 Descargar resultados en CSV",
+        data=csv_buffer.getvalue(),
+        file_name="roi_mean_values.csv",
+        mime="text/csv"
+    )
+
+    return df_final
 
 
 
@@ -256,7 +322,7 @@ def app_main():
 
     if processed_stack is not None and tiff_path:
         tiff_files=processed_visualizer(processed_stack,tiff_path)
-        tracking_roi_selector(tiff_files,processed_stack)
+        roi_tracks=tracking_roi_selector(tiff_files,processed_stack,metadata)
     
     else:
         st.info("Aún no hay índices para el viewer (se crean al cargar el .npy).")
