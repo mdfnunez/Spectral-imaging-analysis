@@ -4,10 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import easygui
 import os
-import cv2
-import tifffile as tiff
 from tiffile import imwrite
-from bisect import bisect_right
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -41,13 +38,8 @@ def folder_path_acquisition():
         )
         if path:
             data = np.load(path, allow_pickle=False, mmap_mode="r")
-            reflectance_stack = data  # memmap-like
-
-            if reflectance_stack.dtype == np.float64:
-                st.warning("Reflectance en float64. Convertiré por bloques a float32 si procesas todo.")
-
-            # Guardar en session_state
-            st.session_state['reflectance_stack'] = reflectance_stack
+            # Save in session_state
+            st.session_state['reflectance_stack'] = data
             st.session_state['reflectance_path'] = path
 
             if "logs" not in st.session_state:
@@ -57,18 +49,8 @@ def folder_path_acquisition():
             )
             st.sidebar.caption(st.session_state["reflectance_path"])
             st.sidebar.caption(st.session_state["reflectance_stack"].shape)
-            # ← Return explícito
             
-
-    # Si no se seleccionó nada, devuelve None
     return st.session_state["reflectance_stack"]
-#load variables
-try:
-    reflectance_stack=folder_path_acquisition()
-except:
-    st.info('Load .npy file')
-# Ends load variables
-
 
 def reflectance_visualization(reflectance_stack):
     with st.expander('Visualization of reflectance images'):
@@ -87,9 +69,6 @@ def reflectance_visualization(reflectance_stack):
         
         st.pyplot(fig)
 
-
-reflectance_visualization(reflectance_stack)
-#Band selection 
 def band_selection():
     # --- 1) Load wavelengts from XML ---
     tree = ET.parse("ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml")
@@ -107,16 +86,14 @@ def band_selection():
     df_spec = pd.read_excel("ximea files/HbO2_Hb_spectrum_full.xlsx")
     with st.expander('Molar extinction coefficients', expanded=False):
         st.dataframe(df_spec, hide_index=True)
-
     # --- 3) Band selection interface ---
     with col2:
         band1 = st.slider("Select band for HbO₂", min_value=0, max_value=15, value=13, step=1, key="band1_spec")
-    with col2:
         band2 = st.slider("Select band for Hb", min_value=0, max_value=15, value=11, step=1, key="band2_spec")
 
     # Evitar que elijan la misma banda (no hay separación)
     if band1 == band2:
-        st.error("Selecciona dos bandas distintas. Con la misma banda no hay separación.")
+        st.error("Select different bands")
         return None, None, None, None, None, None, None, band1, band2
 
     # Selection of wavelength in wavelengths with the sliders
@@ -133,7 +110,6 @@ def band_selection():
             ax.plot(df_zoom["lambda"], df_zoom["Hb02"], label="ε HbO₂", color="crimson")
             ax.plot(df_zoom["lambda"], df_zoom["Hb"], label="ε Hb", color="royalblue")
             ax.fill_between(df_zoom["lambda"], df_zoom["Hb02"], df_zoom["Hb"], color='gray', alpha=0.4)
-
             ax.axvline(λ1, color="crimson", linestyle="--", lw=2, label=f"Band HbO₂ ~ {λ1} nm")
             ax.axvline(λ2, color="royalblue", linestyle="--", lw=2, label=f"Band Hb ~ {λ2} nm")
 
@@ -143,6 +119,8 @@ def band_selection():
             ax.grid(True)
             ax.legend()
             st.pyplot(fig)
+           
+
 
     # --- 7) Tomar la fila más cercana a cada λ (si no hay match exacto) ---
     # Buscar coincidencia cercana a λ1
@@ -160,6 +138,7 @@ def band_selection():
         row2 = df_zoom.loc[idx2]
     else:
         row2 = match2.iloc[0]
+    st.info(f"1st wavelength {row1[0]}   | second wavelength {row2[0]}")
 
     # --- 8) Acquire absorbance coefficients ---
     Hb02_λ1 = float(row1['Hb02'])
@@ -240,24 +219,24 @@ def band_selection():
 
 def mbll_2w_save_npy(
     R,                 # reflectance_stack: (T, C, H, W)  float o uint16
-    band1, band2,      # índices de banda (λ1, λ2)
-    eps_HbO2_1, eps_Hb_1,   # ε en λ1
-    eps_HbO2_2, eps_Hb_2,   # ε en λ2
+    band1, band2,      
+    eps_HbO2_1, eps_Hb_1,   # ε in λ1
+    eps_HbO2_2, eps_Hb_2,   # ε in λ2
     baseline_frames=60,
     StO2_0=0.70,
-    DPF1=0.5, DPF2=0.5,
-    chunk_size=32      # nº de frames por bloque en el bucle
+    DPF1=0.5, DPF2=0.5, ###Based on literature
+    chunk_size=32      
 ):
     
     eps = 1e-8
     T, C, H, W = R.shape
     n = min(baseline_frames, T)
 
-    # --- Baseline explícito (promedio primeros n frames por banda)
+    # --- Average of first baseline images
     I01 = R[:n, band1].mean(axis=0, dtype=np.float64).astype(np.float32) + eps  # (H,W)
     I02 = R[:n, band2].mean(axis=0, dtype=np.float64).astype(np.float32) + eps  # (H,W)
 
-    # --- Matriz E con DPF incluido e inversa cerrada (2x2)
+    # --- Matrix E with DPF (2x2), determinant calculation
     a11 = DPF1 * eps_HbO2_1
     a12 = DPF1 * eps_Hb_1
     a21 = DPF2 * eps_HbO2_2
@@ -266,31 +245,31 @@ def mbll_2w_save_npy(
 
     if abs(det) < 1e-12:
         raise ValueError("Matriz mal condicionada (det≈0). Cambia λ1/λ2 o DPF.")
+    #Inversion of matrix
     inv11 =  a22 / det; inv12 = -a12 / det
     inv21 = -a21 / det; inv22 =  a11 / det
 
-    # --- Ancla basal para StO2 absoluta (tHb0=1)
+    # --- Base for StO2 (tHb0=1)
     HbO2_0 = float(StO2_0)
     Hb_0   = float(1.0 - StO2_0)
 
-    # --- Crea archivos memmap de salida (evita usar RAM)
+    # --- create memmap output files (avoid excesive use of RAM)
     dHbO2_mm   = np.lib.format.open_memmap(f"{default}_dHbO2.npy", mode='w+', dtype=np.float32, shape=(T, H, W))
     dHb_mm     = np.lib.format.open_memmap(f"{default}_dHb.npy",   mode='w+', dtype=np.float32, shape=(T, H, W))
     StO2_mm    = np.lib.format.open_memmap(f"{default}_StO2.npy",  mode='w+', dtype=np.float32, shape=(T, H, W))
     StO2mean_mm= np.lib.format.open_memmap(f"{default}_StO2_mean.npy", mode='w+', dtype=np.float32, shape=(T,))
 
-    # --- Procesa por bloques en T
     for t0 in range(0, T, chunk_size):
         t1 = min(t0 + chunk_size, T)
 
         I1 = R[t0:t1, band1].astype(np.float32)    # (B,H,W)
         I2 = R[t0:t1, band2].astype(np.float32)    # (B,H,W)
 
-        # ΔOD = -ln(I/I0), con clip de seguridad
+        # ΔOD = -ln(I/I0), 
         dOD1 = -np.log(np.clip(I1 / I01, eps, None))
         dOD2 = -np.log(np.clip(I2 / I02, eps, None))
 
-        # x = E^{-1} y  (vectorizado)
+        # x = E^{-1} y  (Vectorization)
         dHbO2_blk = inv11 * dOD1 + inv12 * dOD2     # (B,H,W)
         dHb_blk   = inv21 * dOD1 + inv22 * dOD2     # (B,H,W)
 
@@ -376,12 +355,7 @@ def _to_uint16_gray(img, p_low=2, p_high=98, gamma=1.0, ignore_zeros=True):
 # ---------- Exportador con fidelidad (normalización conjunta) ----------
 
 def tiffiles_export(reflectance_stack, out_root="/home/alonso/Desktop"):
-    """
-    Exporta TIFFs manteniendo fidelidad espectral:
-      - GRAYSCALE: canal fijo (GRAY_CH) con percentiles 2–98 y gamma común.
-      - RGB: canales (R_idx,G_idx,B_idx) con normalización CONJUNTA (vmin/vmax) y gamma común.
-    Asume reflectance_stack shape = (T, C, H, W), ordenado por λ ascendente.
-    """
+    
     if reflectance_stack is None:
         raise ValueError("reflectance_stack es None.")
     T, C, H, W = reflectance_stack.shape
@@ -397,7 +371,7 @@ def tiffiles_export(reflectance_stack, out_root="/home/alonso/Desktop"):
 
     # Carpeta de salida
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(out_root, f"TIFFs_fidelidad_{stamp}")
+    out_dir = os.path.join(out_root, f"TIFFs_{stamp}")
     out_gray = os.path.join(out_dir, "grayscale")
     out_rgb  = os.path.join(out_dir, "rgb")
     os.makedirs(out_gray, exist_ok=True)
@@ -422,7 +396,13 @@ def tiffiles_export(reflectance_stack, out_root="/home/alonso/Desktop"):
     return out_dir
 
 
-
+#load variables
+try:
+    reflectance_stack=folder_path_acquisition()
+except:
+    st.info('Load .npy file')
+# Ends load variables
+reflectance_visualization(reflectance_stack)
 
 col1,col2,col3=st.columns([1,1,0.5])
 with col1:

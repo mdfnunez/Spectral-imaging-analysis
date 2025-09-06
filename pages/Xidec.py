@@ -7,27 +7,25 @@ import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from tifffile import imwrite
-from numpy.lib.format import open_memmap  # 👈 clave para .npy sin RAM
-import os, json
+from numpy.lib.format import open_memmap  
+import os
 
 #Header
 st.set_page_config('Xidec',layout="wide")
 st.title('Xidec')
 st.caption('Software for decompression of .b2nd files from the Xilens program')
-st.info('The output reflectance_date.npy file has its bands reordered in an ascendent fashion band 0= 460 nm, band 15=594 nm, sensor response and black and white calculations')
+st.caption('The output reflectance_date.npy file has its bands reordered in an ascendent fashion band 0= 460 nm, band 15=594 nm, sensor response and black and white calculations')
 
 # Paths (Change paths to local PC if needed)
 global default
 default="/home/alonso/Desktop/" #change the default path accordingly
-global xml_path
+global xml_path #path to xml file
 xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
 #####
 
 def select_file():
     b2nd_file = easygui.fileopenbox('Select .b2nd file', default=default)
     if b2nd_file is not None:
-
-        # Open .b2nd in lazy mode
         b2nd_loaded = blosc2.open(b2nd_file, mode="r")
         st.session_state["b2nd_loaded"] = b2nd_loaded
         st.sidebar.caption(f"Selected file {b2nd_loaded}")
@@ -38,16 +36,10 @@ def select_file():
         st.session_state['white_path']=white_path
         if white_path:
             st.sidebar.caption(st.session_state["white_path"])
-
-
-            ###Open white file with lazy mode
             white_stack = blosc2.open(white_path, mode="r")
-
             #Get the median by calculating with 100 frames into single one with median per pixel
             median_mosaic_white = np.median(white_stack, axis=0)  # (H,W)
-            
             ### Separate channels 
-            
             white_per_channel = np.stack(
                 [median_mosaic_white[i::4, j::4] for i in range(4) for j in range(4)],
                 axis=0
@@ -161,13 +153,13 @@ def demosaic_and_save(b2nd, dark_vec, white_vec):
         return resp_scalar_idx,wavelengths_idx,
 
     resp_scalar_idx, wavelengths_idx = calibration_data()
+    #align for computation
     resp = resp_scalar_idx[:, None, None].astype(np.float32)  # (16,1,1)
 
-    #Reorganize bands, will be used after reflectance calculations
     sort_idx = np.argsort(wavelengths_idx)     
+    #gives the current order of the wavlenghts
 
-    
-    # Datos de ejemplo
+        # Datos de ejemplo
     N, H, W = len(b2nd), *b2nd[0].shape
 
     # Crear timestamp (ej: 2025-08-31_14-32-10)
