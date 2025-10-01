@@ -9,7 +9,7 @@ import cv2
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import simpledialog
-import tiffile as tiff
+import tifffile as tiff
 import glob
 
 
@@ -154,19 +154,107 @@ import streamlit as st
 DEFAULT_VIDEO_PATH = default  # <- tu variable/carpeta por defecto
 
 def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output_video='tracking_output.avi'):
-    if st.button("Select ROIs & Track"):
-        # --- Frame 0 crudo ---
-        img0 = tiff.imread(tiff_files[0])
-        if img0.ndim == 3:
-            img0 = img0[..., 0]
-        H, W = img0.shape
+    import math, base64, io
+    import numpy as np, tifffile as tiff, cv2
+    from PIL import Image, ImageTk
+    import tkinter as tk
+    from tkinter import simpledialog
 
+    # ---------- Helpers locales (auto-contenidos) ----------
+    def _ensure_gray(img):
+        return img[..., 0] if (img.ndim == 3) else img
+
+    def _to_uint8(img):
+        if img.dtype == np.uint16:
+            return (img >> 8).astype(np.uint8)
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    def _encode_png_u8(img_u8):
+        ok, buf = cv2.imencode(".png", img_u8)
+        if not ok:
+            raise RuntimeError("No se pudo codificar plantilla PNG.")
+        return base64.b64encode(buf.tobytes()).decode("ascii")
+
+    def _decode_png_to_u8(b64):
+        arr = np.frombuffer(base64.b64decode(b64.encode("ascii")), dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        return img
+
+    def _build_saved_payload_from_rois(img0_u8, rois_local):
+        payload = {"image_shape": img0_u8.shape, "rois": []}
+        for roi in rois_local:
+            x, y, w, h = roi["rect"]
+            tpl = img0_u8[y:y+h, x:x+w].copy()
+            payload["rois"].append({
+                "name": roi["name"],
+                "rect": [int(x), int(y), int(w), int(h)],
+                "inners": [
+                    {
+                        "name": (inn.get("name") if inn.get("name") else None),
+                        "rect": [int(ix), int(iy), int(iw), int(ih)]
+                    } for inn in roi.get("inners", [])
+                ],
+                "template_png_b64": _encode_png_u8(tpl)
+            })
+        return payload
+
+    def _rois_from_saved_on_new_img0(saved_payload, img0_f32):
+        rois_local = []
+        for r in saved_payload.get("rois", []):
+            name = r["name"]
+            _, _, w, h = r["rect"]
+            tpl_u8 = _decode_png_to_u8(r["template_png_b64"]).astype(np.float32)
+            res = cv2.matchTemplate(img0_f32, tpl_u8, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(res)
+            nx, ny = int(max_loc[0]), int(max_loc[1])
+            rois_local.append({
+                "name": name,
+                "rect": (nx, ny, w, h),
+                "inners": [
+                    {"name": inn.get("name"), "rect": tuple(inn["rect"])}
+                    for inn in r.get("inners", [])
+                ]
+            })
+        return rois_local
+
+    # ---------- UI: modo de trabajo ----------
+    mode = st.radio(
+        "ROIs a usar:",
+        options=["🆕 Nuevos ROIs", "🗂️ Usar ROIs en sesión"],
+        horizontal=True
+    )
+
+    go = st.button("Select ROIs & Track")
+    if not go:
+        return
+
+    # --- Frame 0 crudo ---
+    img0_raw = _ensure_gray(tiff.imread(tiff_files[0]))
+    H, W = img0_raw.shape
+    img0_u8 = _to_uint8(img0_raw)
+    img0_f32 = img0_u8.astype(np.float32)
+
+    rois_local = []
+
+    # ---------- Opción A: usar ROIs guardados ----------
+    if mode == "🗂️ Usar ROIs en sesión":
+        saved = st.session_state.get("saved_rois", None)
+        if not saved or not saved.get("rois"):
+            st.warning("No hay ROIs guardados en sesión. Dibuja nuevos ROIs.")
+            mode = "🆕 Nuevos ROIs"  # fallback a dibujar
+        else:
+            try:
+                rois_local = _rois_from_saved_on_new_img0(saved, img0_f32)
+            except Exception as e:
+                st.error(f"No se pudieron reubicar los ROIs guardados: {e}")
+                mode = "🆕 Nuevos ROIs"  # fallback
+
+    # ---------- Opción B: dibujar ROIs nuevos ----------
+    if mode == "🆕 Nuevos ROIs":
         # Vista para UI (solo mostrar; cálculos usan crudo)
-        ui_preview = (img0 >> 8).astype(np.uint8) if img0.dtype == np.uint16 else np.clip(img0,0,255).astype(np.uint8)
+        ui_preview = img0_u8
 
-        # ============================================================
-        # Ventana 1: ROI GRANDE (tracking) con escala EXACTA = 'scale'
-        # ============================================================
+        # ====== Ventana 1: ROI GRANDE ======
         rois_local = []
         root = tk.Tk(); root.title("Select TRACKING ROIs (large)")
         dispW, dispH = int(W*scale), int(H*scale)
@@ -188,7 +276,6 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             if ws > 0 and hs > 0:
                 name = simpledialog.askstring("ROI Name", "Name for this LARGE ROI:", parent=root)
                 if name:
-                    # Volver a coords originales
                     x0 = int(math.floor(xs / scale)); y0 = int(math.floor(ys / scale))
                     x1 = int(math.ceil((xs + ws) / scale)); y1 = int(math.ceil((ys + hs) / scale))
                     x0, y0 = max(0,x0), max(0,y0)
@@ -204,16 +291,14 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             st.info("No ROIs selected.")
             return
 
-        # ============================================================
-        # Ventana 2: múltiples ROIs PEQUEÑAS por cada GRANDE (zoom)
-        # ============================================================
+        # ====== Ventana 2: ROIs PEQUEÑAS por cada GRANDE ======
         TARGET_MIN_WIDTH = 800
         MAX_INNER_SCALE = 8
         MIN_INNER_SCALE = 2
 
         for roi in rois_local:
             name = roi['name']; x, y, w, h = roi['rect']
-            crop = ui_preview[y:y+h, x:x+w]
+            crop = img0_u8[y:y+h, x:x+w]
             roi['inners'] = []
             if crop.size == 0:
                 continue
@@ -258,84 +343,81 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             tk.Button(btn_box, text="Skip (none)", command=lambda: (roi['inners'].clear(), done())).pack(side='left', padx=6)
             inner_root.mainloop()
 
-        # ============================================================
-        # Tracking (template = ROI grande del frame 0)
-        # ============================================================
-        roi_tracks = []
-        for roi in rois_local:
-            name = roi['name']; x, y, w, h = roi['rect']
-            template = img0[y:y+h, x:x+w].astype(np.float32)
-            coords = []
-            for i, f in enumerate(tiff_files):
-                img = tiff.imread(f)
-                if img.ndim == 3: img = img[..., 0]
-                res = cv2.matchTemplate(img.astype(np.float32), template, cv2.TM_CCOEFF_NORMED)
-                _, _, _, max_loc = cv2.minMaxLoc(res)
-                coords.append((i, max_loc[0], max_loc[1], w, h))
-            roi_tracks.append({'name': name, 'coords': coords, 'inners_rel': roi['inners']})
+    # ---------- Tracking por template (ROI grande del frame 0) ----------
+    roi_tracks = []
+    for roi in rois_local:
+        name = roi['name']; x, y, w, h = roi['rect']
+        template = img0_raw[y:y+h, x:x+w].astype(np.float32)
+        coords = []
+        for i, f in enumerate(tiff_files):
+            img = _ensure_gray(tiff.imread(f)).astype(np.float32)
+            res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(res)
+            coords.append((i, max_loc[0], max_loc[1], w, h))
+        roi_tracks.append({'name': name, 'coords': coords, 'inners_rel': roi.get('inners', [])})
 
-        # ============================================================
-        # Video (gris) + etiquetas: grande y pequeñas en ROJO; texto pequeño
-        # ============================================================
-        if os.path.isabs(output_video) or os.path.dirname(output_video):
-            video_path = output_video
-        else:
-            os.makedirs(DEFAULT_VIDEO_PATH, exist_ok=True)
-            video_path = os.path.join(DEFAULT_VIDEO_PATH, output_video)
+    # ---------- Video con overlays ----------
+    if os.path.isabs(output_video) or os.path.dirname(output_video):
+        video_path = output_video
+    else:
+        os.makedirs(DEFAULT_VIDEO_PATH, exist_ok=True)
+        video_path = os.path.join(DEFAULT_VIDEO_PATH, output_video)
 
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        out = cv2.VideoWriter(video_path, fourcc, 10, (W, H))
+    out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'XVID'), 10, (W, H))
+    for i in range(len(tiff_files)):
+        img = _ensure_gray(tiff.imread(tiff_files[i]))
+        frame8 = _to_uint8(img if img.dtype == np.uint8 else img.astype(np.uint16))
+        frame_bgr = cv2.cvtColor(frame8, cv2.COLOR_GRAY2BGR)
 
-        T = len(tiff_files)
-        for i in range(T):
-            img = tiff.imread(tiff_files[i])
-            if img.ndim == 3: img = img[..., 0]
-            frame8 = (img >> 8).astype(np.uint8) if img.dtype == np.uint16 else np.clip(img,0,255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame8, cv2.COLOR_GRAY2BGR)
-
-            for roi in roi_tracks:
-                _, x0, y0, w0, h0 = roi['coords'][i]
-                # ROI grande (rojo)
-                cv2.rectangle(frame_bgr, (x0, y0), (x0+w0, y0+h0), (0,0,255), 2)
-
-                # ROIs pequeñas (rojo) + etiqueta (nombre o índice)
-                inners = roi.get('inners_rel', [])
-                for idx, inner in enumerate(inners, start=1):
-                    ix, iy, iw, ih = inner['rect']
-                    cx, cy = x0 + ix, y0 + iy
-                    cv2.rectangle(frame_bgr, (cx, cy), (cx+iw, cy+ih), (0,0,255), 2)
-                    label_text = inner['name'].strip() if inner.get('name') else str(idx)
-                    cv2.putText(frame_bgr, label_text, (cx, max(0, cy-3)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,255), 1, cv2.LINE_AA)
-
-            out.write(frame_bgr)
-        out.release()
-
-        st.success(f"✅ Tracking done. Video saved as: {video_path}")
-        st.session_state["roi_tracks"] = roi_tracks
-        st.session_state["video_file"] = video_path
-
-        # ============================================================
-        # Métricas: usar nombre de ROI pequeño si existe; si no, BIG_smallN
-        # ============================================================
-        measure_tracks = []
         for roi in roi_tracks:
-            big_name = roi['name']
-            inners = roi.get('inners_rel', [])
-            if inners:
-                for idx, inner in enumerate(inners, start=1):
-                    ix, iy, iw, ih = inner['rect']
-                    series = []
-                    for (i, x0, y0, w0, h0) in roi['coords']:
-                        series.append((i, x0+ix, y0+iy, iw, ih))
-                    metric_name = inner['name'].strip() if inner.get('name') else f"{big_name}_small{idx}"
-                    measure_tracks.append({'name': metric_name, 'coords': series})
-            else:
-                measure_tracks.append({'name': big_name, 'coords': roi['coords']})
+            _, x0, y0, w0, h0 = roi['coords'][i]
+            cv2.rectangle(frame_bgr, (x0, y0), (x0+w0, y0+h0), (0,0,255), 2)
 
-        # Pasa nombres correctos a tu cálculo
-        compute_mean_in_tracked_rois(processed_stack, measure_tracks, metadata)
-        return roi_tracks
+            for idx, inner in enumerate(roi.get('inners_rel', []), start=1):
+                ix, iy, iw, ih = inner['rect']
+                cx, cy = x0 + ix, y0 + iy
+                cv2.rectangle(frame_bgr, (cx, cy), (cx+iw, cy+ih), (0,0,255), 2)
+                label_text = inner['name'].strip() if inner.get('name') else str(idx)
+                cv2.putText(frame_bgr, label_text, (cx, max(0, cy-3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,255), 1, cv2.LINE_AA)
+        out.write(frame_bgr)
+    out.release()
+
+    st.success(f"✅ Tracking done. Video saved as: {video_path}")
+    st.session_state["roi_tracks"] = roi_tracks
+    st.session_state["video_file"] = video_path
+
+    # ---------- Guardar/actualizar ROIs en sesión (con plantilla) ----------
+    # (Siempre actualizamos a lo último usado/definido)
+    saved_payload = _build_saved_payload_from_rois(img0_u8, [
+        {
+            "name": r["name"],
+            "rect": (r["coords"][0][1], r["coords"][0][2], r["coords"][0][3], r["coords"][0][4]),  # (x,y,w,h) del frame 0
+            "inners": r.get("inners_rel", [])
+        }
+        for r in roi_tracks
+    ])
+    st.session_state["saved_rois"] = saved_payload
+
+    # ---------- Métricas ----------
+    measure_tracks = []
+    for roi in roi_tracks:
+        big_name = roi['name']
+        inners = roi.get('inners_rel', [])
+        if inners:
+            for idx, inner in enumerate(inners, start=1):
+                ix, iy, iw, ih = inner['rect']
+                series = []
+                for (i, x0, y0, w0, h0) in roi['coords']:
+                    series.append((i, x0+ix, y0+iy, iw, ih))
+                metric_name = inner['name'].strip() if inner.get('name') else f"{big_name}_small{idx}"
+                measure_tracks.append({'name': metric_name, 'coords': series})
+        else:
+            measure_tracks.append({'name': big_name, 'coords': roi['coords']})
+
+    compute_mean_in_tracked_rois(processed_stack, measure_tracks, metadata)
+    return roi_tracks
+
 
 def normalize_img(img, p1=1, p99=99):
     """Escala imagen a 8-bit con percentiles."""
