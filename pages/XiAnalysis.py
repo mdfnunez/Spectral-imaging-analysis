@@ -154,13 +154,13 @@ import streamlit as st
 DEFAULT_VIDEO_PATH = default  # <- tu variable/carpeta por defecto
 
 def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output_video='tracking_output.avi'):
-    import math, base64, io
+    import os, math, base64, json
     import numpy as np, tifffile as tiff, cv2
     from PIL import Image, ImageTk
     import tkinter as tk
     from tkinter import simpledialog
 
-    # ---------- Helpers locales (auto-contenidos) ----------
+    # ---------- Helpers ----------
     def _ensure_gray(img):
         return img[..., 0] if (img.ndim == 3) else img
 
@@ -172,7 +172,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     def _encode_png_u8(img_u8):
         ok, buf = cv2.imencode(".png", img_u8)
         if not ok:
-            raise RuntimeError("No se pudo codificar plantilla PNG.")
+            raise RuntimeError("No se pudo codificar PNG.")
         return base64.b64encode(buf.tobytes()).decode("ascii")
 
     def _decode_png_to_u8(b64):
@@ -180,44 +180,110 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
         img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
         return img
 
+    def _sanitize_inner_rel(inners, bw, bh):
+        fixed = []
+        for inn in inners:
+            name = inn.get("name")
+            ix, iy, iw, ih = map(int, inn["rect"])
+            ix = max(0, min(ix, max(0, bw - 1)))
+            iy = max(0, min(iy, max(0, bh - 1)))
+            iw = max(1, min(iw, max(1, bw - ix)))
+            ih = max(1, min(ih, max(1, bh - iy)))
+            fixed.append({"name": name, "rect": (ix, iy, iw, ih)})
+        return fixed
+
+    # --- NUEVO: desduplicar (por si el mouse/escala dio el mismo rect 2 veces)
+    def _dedup_inner_rects(inners):
+        seen = set()
+        dedup = []
+        for inn in inners:
+            key = tuple(map(int, inn["rect"]))
+            if key in seen:
+                # desplazar 2 px si cabe; si no, 1 px
+                ix, iy, iw, ih = key
+                ix = ix + 2
+                iy = iy + 2
+                inn = {**inn, "rect": (ix, iy, iw, ih)}
+                key = (ix, iy, iw, ih)
+            seen.add(key)
+            dedup.append(inn)
+        return dedup
+
+    # --- NUEVO: construir payload guardando template del BIG y de cada INNER
     def _build_saved_payload_from_rois(img0_u8, rois_local):
+        """
+        rois_local:
+          - name
+          - rect: (x,y,w,h) ABS en frame 0 (de la imagen completa)
+          - inners: lista de dicts con:
+              name
+              rect: (ix,iy,iw,ih) RELATIVOS al big ROI
+        """
         payload = {"image_shape": img0_u8.shape, "rois": []}
         for roi in rois_local:
-            x, y, w, h = roi["rect"]
-            tpl = img0_u8[y:y+h, x:x+w].copy()
+            bx, by, bw, bh = map(int, roi["rect"])
+            big_tpl = img0_u8[by:by+bh, bx:bx+bw].copy()
+
+            inners_out = []
+            for inn in roi.get("inners", []):
+                ix, iy, iw, ih = map(int, inn["rect"])
+                ix = max(0, min(ix, max(0, bw - 1)))
+                iy = max(0, min(iy, max(0, bh - 1)))
+                iw = max(1, min(iw, max(1, bw - ix)))
+                ih = max(1, min(ih, max(1, bh - iy)))
+                inner_tpl = big_tpl[iy:iy+ih, ix:ix+iw].copy()
+                inners_out.append({
+                    "name": (inn.get("name") if inn.get("name") else None),
+                    "rect": [ix, iy, iw, ih],  # SIEMPRE relativos
+                    "inner_template_png_b64": _encode_png_u8(inner_tpl)  # NUEVO
+                })
+
             payload["rois"].append({
                 "name": roi["name"],
-                "rect": [int(x), int(y), int(w), int(h)],
-                "inners": [
-                    {
-                        "name": (inn.get("name") if inn.get("name") else None),
-                        "rect": [int(ix), int(iy), int(iw), int(ih)]
-                    } for inn in roi.get("inners", [])
-                ],
-                "template_png_b64": _encode_png_u8(tpl)
+                "rect": [bx, by, bw, bh],
+                "inners": inners_out,
+                "template_png_b64": _encode_png_u8(big_tpl)
             })
         return payload
 
-    def _rois_from_saved_on_new_img0(saved_payload, img0_f32):
+    # --- NUEVO: reubicar BIG por template matching y luego reubicar CADA INNER por template dentro del BIG
+    def _rois_from_saved_on_new_img0(saved_payload, img0_u8, img0_f32):
         rois_local = []
         for r in saved_payload.get("rois", []):
             name = r["name"]
-            _, _, w, h = r["rect"]
-            tpl_u8 = _decode_png_to_u8(r["template_png_b64"]).astype(np.float32)
-            res = cv2.matchTemplate(img0_f32, tpl_u8, cv2.TM_CCOEFF_NORMED)
-            _, _, _, max_loc = cv2.minMaxLoc(res)
+            bx0, by0, bw, bh = map(int, r["rect"])
+            big_tpl_u8 = _decode_png_to_u8(r["template_png_b64"]).astype(np.float32)
+            res_big = cv2.matchTemplate(img0_f32, big_tpl_u8, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(res_big)
             nx, ny = int(max_loc[0]), int(max_loc[1])
+
+            # recorte actual del BIG en el frame 0 nuevo
+            big_now = img0_u8[ny:ny+bh, nx:nx+bw].copy().astype(np.float32)
+
+            inners_rel = []
+            for inn in r.get("inners", []):
+                ix, iy, iw, ih = map(int, inn["rect"])
+                # Si tenemos plantilla del inner, la usamos para refinar su posición dentro del big actual
+                if "inner_template_png_b64" in inn and inn["inner_template_png_b64"]:
+                    inner_tpl = _decode_png_to_u8(inn["inner_template_png_b64"]).astype(np.float32)
+                    # buscar dentro del BIG actual (con margen de seguridad)
+                    if inner_tpl.shape[0] > 0 and inner_tpl.shape[1] > 0 and \
+                       big_now.shape[0] >= inner_tpl.shape[0] and big_now.shape[1] >= inner_tpl.shape[1]:
+                        res_in = cv2.matchTemplate(big_now, inner_tpl, cv2.TM_CCOEFF_NORMED)
+                        _, _, _, in_loc = cv2.minMaxLoc(res_in)
+                        ix, iy = int(in_loc[0]), int(in_loc[1])
+                inners_rel.append({"name": inn.get("name"), "rect": (ix, iy, iw, ih)})
+
+            inners_rel = _sanitize_inner_rel(_dedup_inner_rects(inners_rel), bw, bh)
+
             rois_local.append({
                 "name": name,
-                "rect": (nx, ny, w, h),
-                "inners": [
-                    {"name": inn.get("name"), "rect": tuple(inn["rect"])}
-                    for inn in r.get("inners", [])
-                ]
+                "rect": (nx, ny, bw, bh),  # ABS
+                "inners": inners_rel       # REL
             })
         return rois_local
 
-    # ---------- UI: modo de trabajo ----------
+    # ---------- UI ----------
     mode = st.radio(
         "ROIs a usar:",
         options=["🆕 Nuevos ROIs", "🗂️ Usar ROIs en sesión"],
@@ -241,17 +307,16 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
         saved = st.session_state.get("saved_rois", None)
         if not saved or not saved.get("rois"):
             st.warning("No hay ROIs guardados en sesión. Dibuja nuevos ROIs.")
-            mode = "🆕 Nuevos ROIs"  # fallback a dibujar
+            mode = "🆕 Nuevos ROIs"
         else:
             try:
-                rois_local = _rois_from_saved_on_new_img0(saved, img0_f32)
+                rois_local = _rois_from_saved_on_new_img0(saved, img0_u8, img0_f32)
             except Exception as e:
                 st.error(f"No se pudieron reubicar los ROIs guardados: {e}")
-                mode = "🆕 Nuevos ROIs"  # fallback
+                mode = "🆕 Nuevos ROIs"
 
     # ---------- Opción B: dibujar ROIs nuevos ----------
     if mode == "🆕 Nuevos ROIs":
-        # Vista para UI (solo mostrar; cálculos usan crudo)
         ui_preview = img0_u8
 
         # ====== Ventana 1: ROI GRANDE ======
@@ -291,7 +356,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             st.info("No ROIs selected.")
             return
 
-        # ====== Ventana 2: ROIs PEQUEÑAS por cada GRANDE ======
+        # ====== Ventana 2: ROIs PEQUEÑAS (relativas) ======
         TARGET_MIN_WIDTH = 800
         MAX_INNER_SCALE = 8
         MIN_INNER_SCALE = 2
@@ -331,6 +396,8 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
                     small_name = (small_name.strip() if small_name else None)
                     roi['inners'].append({'name': small_name, 'rect': (ix0, iy0, ix1 - ix0, iy1 - iy0)})
             def done():
+                # dedup + clamp antes de cerrar
+                roi['inners'] = _sanitize_inner_rel(_dedup_inner_rects(roi.get('inners', [])), w, h)
                 inner_root.destroy()
             def clear_last():
                 if roi['inners']: roi['inners'].pop()
@@ -343,17 +410,17 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             tk.Button(btn_box, text="Skip (none)", command=lambda: (roi['inners'].clear(), done())).pack(side='left', padx=6)
             inner_root.mainloop()
 
-    # ---------- Tracking por template (ROI grande del frame 0) ----------
+    # ---------- Tracking del BIG (por template) ----------
     roi_tracks = []
     for roi in rois_local:
-        name = roi['name']; x, y, w, h = roi['rect']
-        template = img0_raw[y:y+h, x:x+w].astype(np.float32)
+        name = roi['name']; x, y, w, h = map(int, roi['rect'])
+        template = _ensure_gray(img0_raw[y:y+h, x:x+w]).astype(np.float32)
         coords = []
         for i, f in enumerate(tiff_files):
             img = _ensure_gray(tiff.imread(f)).astype(np.float32)
             res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
             _, _, _, max_loc = cv2.minMaxLoc(res)
-            coords.append((i, max_loc[0], max_loc[1], w, h))
+            coords.append((i, int(max_loc[0]), int(max_loc[1]), w, h))
         roi_tracks.append({'name': name, 'coords': coords, 'inners_rel': roi.get('inners', [])})
 
     # ---------- Video con overlays ----------
@@ -366,7 +433,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'XVID'), 10, (W, H))
     for i in range(len(tiff_files)):
         img = _ensure_gray(tiff.imread(tiff_files[i]))
-        frame8 = _to_uint8(img if img.dtype == np.uint8 else img.astype(np.uint16))
+        frame8 = _to_uint8(img)
         frame_bgr = cv2.cvtColor(frame8, cv2.COLOR_GRAY2BGR)
 
         for roi in roi_tracks:
@@ -374,8 +441,8 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             cv2.rectangle(frame_bgr, (x0, y0), (x0+w0, y0+h0), (0,0,255), 2)
 
             for idx, inner in enumerate(roi.get('inners_rel', []), start=1):
-                ix, iy, iw, ih = inner['rect']
-                cx, cy = x0 + ix, y0 + iy
+                ix, iy, iw, ih = map(int, inner['rect'])  # relativos
+                cx, cy = x0 + ix, y0 + iy                 # absolutos
                 cv2.rectangle(frame_bgr, (cx, cy), (cx+iw, cy+ih), (0,0,255), 2)
                 label_text = inner['name'].strip() if inner.get('name') else str(idx)
                 cv2.putText(frame_bgr, label_text, (cx, max(0, cy-3)),
@@ -387,16 +454,17 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     st.session_state["roi_tracks"] = roi_tracks
     st.session_state["video_file"] = video_path
 
-    # ---------- Guardar/actualizar ROIs en sesión (con plantilla) ----------
-    # (Siempre actualizamos a lo último usado/definido)
-    saved_payload = _build_saved_payload_from_rois(img0_u8, [
-        {
+    # ---------- Guardar/actualizar ROIs en sesión (con templates BIG+INNER) ----------
+    saved_rois_input = []
+    for r in roi_tracks:
+        _, bx, by, bw, bh = r["coords"][0]
+        inners_rel = _sanitize_inner_rel(r.get("inners_rel", []), bw, bh)
+        saved_rois_input.append({
             "name": r["name"],
-            "rect": (r["coords"][0][1], r["coords"][0][2], r["coords"][0][3], r["coords"][0][4]),  # (x,y,w,h) del frame 0
-            "inners": r.get("inners_rel", [])
-        }
-        for r in roi_tracks
-    ])
+            "rect": (bx, by, bw, bh),
+            "inners": inners_rel
+        })
+    saved_payload = _build_saved_payload_from_rois(img0_u8, saved_rois_input)
     st.session_state["saved_rois"] = saved_payload
 
     # ---------- Métricas ----------
@@ -406,7 +474,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
         inners = roi.get('inners_rel', [])
         if inners:
             for idx, inner in enumerate(inners, start=1):
-                ix, iy, iw, ih = inner['rect']
+                ix, iy, iw, ih = map(int, inner['rect'])
                 series = []
                 for (i, x0, y0, w0, h0) in roi['coords']:
                     series.append((i, x0+ix, y0+iy, iw, ih))
@@ -419,6 +487,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     return roi_tracks
 
 
+
 def normalize_img(img, p1=1, p99=99):
     """Escala imagen a 8-bit con percentiles."""
     img = img.astype(np.float32)
@@ -426,13 +495,21 @@ def normalize_img(img, p1=1, p99=99):
     img = np.clip(img, lo, hi)
     return (255 * (img - lo) / (hi - lo + 1e-5)).astype(np.uint8)
 
-
-def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None):
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None, n_base=50, percent=True):
+    """
+    Calcula la media por ROI y normaliza cada serie con ΔF/F0 usando los primeros n_base frames de ese ROI.
+    - n_base: número de frames iniciales por ROI para F0.
+    - percent: si True, expresa ΔF/F0 en %.
+    """
     import io
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
 
     height, width = processed_stack.shape[1:]
     rows = []
 
+    # --- Recorrer ROIs y armar tabla larga (frame, roi_name, mean_value)
     for roi in roi_tracks:
         name = roi['name']
         for (frame_id, x, y, w, h) in roi['coords']:
@@ -440,58 +517,96 @@ def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None):
             x1, x2 = max(0, x), min(x + w, width)
             roi_data = processed_stack[frame_id][y1:y2, x1:x2]
             mean_val = float(np.nanmean(roi_data)) if roi_data.size > 0 else None
-            if np.isnan(mean_val):
+            if mean_val is not None and np.isnan(mean_val):
                 mean_val = None
 
             rows.append({
-                "frame": frame_id,
+                "frame": int(frame_id),
                 "roi_name": name,
                 "mean_value": mean_val
             })
 
     # --- DataFrame largo
-    df_long = pd.DataFrame(rows)
+    df_long = pd.DataFrame(rows).dropna(subset=["mean_value"])
+    if df_long.empty:
+        st.warning("⚠️ No hay datos para mostrar.")
+        return pd.DataFrame()
 
-    # --- Convertir a ancho → cada ROI es una columna
-    df_wide = df_long.pivot(index="frame", columns="roi_name", values="mean_value").reset_index()
+    # --- Orden por frame para definir F0 correctamente
+    df_long = df_long.sort_values(["roi_name", "frame"])
 
-    # --- Mostrar tabla
-    st.write("📊 Intensidad media en ROIs:")
-    st.dataframe(df_wide)
+    # --- F0 por ROI = media de los primeros n_base valores disponibles
+    f0_map = (
+        df_long.groupby("roi_name")["mean_value"]
+        .apply(lambda s: float(np.nanmean(s.iloc[:n_base])) if len(s) > 0 else np.nan)
+        .to_dict()
+    )
 
-    # --- Gráfica dinámica con todas las columnas
-    if len(df_wide.columns) > 1:  # hay al menos frame + 1 ROI
-        st.line_chart(df_wide.set_index("frame"))
+    # --- ΔF/F0 (o %). Si F0==0 o NaN, dejar NaN y avisar.
+    def _norm(row):
+        f0 = f0_map.get(row["roi_name"], np.nan)
+        if f0 is None or np.isnan(f0) or f0 == 0:
+            return np.nan
+        val = (row["mean_value"] - f0) / f0
+        if percent:
+            val *= 100.0
+        return float(val)
+
+    df_long["norm_value"] = df_long.apply(_norm, axis=1)
+
+    # --- Avisos de F0 problemático
+    bad_rois = [r for r, f0 in f0_map.items() if (f0 is None or np.isnan(f0) or f0 == 0)]
+    if bad_rois:
+        st.warning(f"⚠️ F₀ no válido (0 o NaN) en: {', '.join(bad_rois)}. Se omiten en la normalización.")
+
+    # --- Tablas anchas
+    df_wide_raw = df_long.pivot(index="frame", columns="roi_name", values="mean_value").reset_index()
+    df_wide_norm = df_long.pivot(index="frame", columns="roi_name", values="norm_value").reset_index()
+
+    # --- Mostrar tablas
+    st.write("📊 Intensidad media en ROIs (sin normalizar):")
+    st.dataframe(df_wide_raw)
+
+    st.write(f"📊 Normalizado con primeros {n_base} frames por ROI (ΔF/F₀{' %' if percent else ''}):")
+    st.dataframe(df_wide_norm)
+
+    # --- Gráficas
+    if len(df_wide_norm.columns) > 1:
+        st.write("📈 Gráfica normalizada (ΔF/F₀):")
+        st.line_chart(df_wide_norm.set_index("frame"))
     else:
         st.warning("⚠️ No se encontraron ROIs para graficar.")
 
-    # --- Si hay metadata, unir
-    df_final = df_wide
+    # --- Unir metadata al normalizado (que es lo que probablemente exportarás)
+    df_final = df_wide_norm.copy()
     if metadata is not None:
         try:
             if not isinstance(metadata, pd.DataFrame):
                 metadata = pd.read_csv(metadata)
 
             if "frame" in metadata.columns:
-                df_final = df_wide.merge(metadata, on="frame", how="left")
+                df_final = df_wide_norm.merge(metadata, on="frame", how="left")
             else:
-                df_final = pd.concat([df_wide, metadata], axis=1)
+                df_final = pd.concat([df_wide_norm, metadata], axis=1)
 
-            st.write("📊 Datos con metadata añadida:")
+            st.write("📊 Datos normalizados con metadata añadida:")
             st.dataframe(df_final)
         except Exception as e:
             st.error(f"Error leyendo metadata: {e}")
 
-    # --- Botón de descarga
+    # --- Descarga
     csv_buffer = io.StringIO()
     df_final.to_csv(csv_buffer, index=False)
     st.download_button(
-        label="📥 Descargar resultados en CSV",
+        label="📥 Descargar resultados normalizados (CSV)",
         data=csv_buffer.getvalue(),
-        file_name="roi_mean_values.csv",
+        file_name="roi_mean_values_normalized.csv",
         mime="text/csv"
     )
 
+    # Para los curiosos: también retorno raw por si luego quieres comparar (ΔF/F₀ no muerde).
+    df_final.attrs["raw"] = df_wide_raw
+    df_final.attrs["f0_map"] = f0_map
     return df_final
 
 
