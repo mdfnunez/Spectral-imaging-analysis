@@ -152,13 +152,15 @@ import streamlit as st
 
 # Ruta por defecto para el video
 DEFAULT_VIDEO_PATH = default  # <- tu variable/carpeta por defecto
-
 def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output_video='tracking_output.avi'):
     import os, math, base64, json
     import numpy as np, tifffile as tiff, cv2
     from PIL import Image, ImageTk
     import tkinter as tk
     from tkinter import simpledialog
+
+    # Ruta por defecto para el video si no existe la constante externa
+    DEFAULT_VIDEO_PATH = os.path.join(os.getcwd(), "videos")
 
     # ---------- Helpers ----------
     def _ensure_gray(img):
@@ -192,33 +194,21 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             fixed.append({"name": name, "rect": (ix, iy, iw, ih)})
         return fixed
 
-    # --- NUEVO: desduplicar (por si el mouse/escala dio el mismo rect 2 veces)
     def _dedup_inner_rects(inners):
         seen = set()
         dedup = []
         for inn in inners:
             key = tuple(map(int, inn["rect"]))
             if key in seen:
-                # desplazar 2 px si cabe; si no, 1 px
                 ix, iy, iw, ih = key
-                ix = ix + 2
-                iy = iy + 2
+                ix += 2; iy += 2
                 inn = {**inn, "rect": (ix, iy, iw, ih)}
                 key = (ix, iy, iw, ih)
             seen.add(key)
             dedup.append(inn)
         return dedup
 
-    # --- NUEVO: construir payload guardando template del BIG y de cada INNER
     def _build_saved_payload_from_rois(img0_u8, rois_local):
-        """
-        rois_local:
-          - name
-          - rect: (x,y,w,h) ABS en frame 0 (de la imagen completa)
-          - inners: lista de dicts con:
-              name
-              rect: (ix,iy,iw,ih) RELATIVOS al big ROI
-        """
         payload = {"image_shape": img0_u8.shape, "rois": []}
         for roi in rois_local:
             bx, by, bw, bh = map(int, roi["rect"])
@@ -233,9 +223,9 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
                 ih = max(1, min(ih, max(1, bh - iy)))
                 inner_tpl = big_tpl[iy:iy+ih, ix:ix+iw].copy()
                 inners_out.append({
-                    "name": (inn.get("name") if inn.get("name") else None),
-                    "rect": [ix, iy, iw, ih],  # SIEMPRE relativos
-                    "inner_template_png_b64": _encode_png_u8(inner_tpl)  # NUEVO
+                    "name": inn.get("name") or None,
+                    "rect": [ix, iy, iw, ih],
+                    "inner_template_png_b64": _encode_png_u8(inner_tpl)
                 })
 
             payload["rois"].append({
@@ -246,7 +236,6 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             })
         return payload
 
-    # --- NUEVO: reubicar BIG por template matching y luego reubicar CADA INNER por template dentro del BIG
     def _rois_from_saved_on_new_img0(saved_payload, img0_u8, img0_f32):
         rois_local = []
         for r in saved_payload.get("rois", []):
@@ -257,16 +246,13 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             _, _, _, max_loc = cv2.minMaxLoc(res_big)
             nx, ny = int(max_loc[0]), int(max_loc[1])
 
-            # recorte actual del BIG en el frame 0 nuevo
             big_now = img0_u8[ny:ny+bh, nx:nx+bw].copy().astype(np.float32)
 
             inners_rel = []
             for inn in r.get("inners", []):
                 ix, iy, iw, ih = map(int, inn["rect"])
-                # Si tenemos plantilla del inner, la usamos para refinar su posición dentro del big actual
                 if "inner_template_png_b64" in inn and inn["inner_template_png_b64"]:
                     inner_tpl = _decode_png_to_u8(inn["inner_template_png_b64"]).astype(np.float32)
-                    # buscar dentro del BIG actual (con margen de seguridad)
                     if inner_tpl.shape[0] > 0 and inner_tpl.shape[1] > 0 and \
                        big_now.shape[0] >= inner_tpl.shape[0] and big_now.shape[1] >= inner_tpl.shape[1]:
                         res_in = cv2.matchTemplate(big_now, inner_tpl, cv2.TM_CCOEFF_NORMED)
@@ -275,15 +261,93 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
                 inners_rel.append({"name": inn.get("name"), "rect": (ix, iy, iw, ih)})
 
             inners_rel = _sanitize_inner_rel(_dedup_inner_rects(inners_rel), bw, bh)
-
-            rois_local.append({
-                "name": name,
-                "rect": (nx, ny, bw, bh),  # ABS
-                "inners": inners_rel       # REL
-            })
+            rois_local.append({"name": name, "rect": (nx, ny, bw, bh), "inners": inners_rel})
         return rois_local
 
-    # ---------- UI ----------
+    # ---------- Screen & Scroll helpers ----------
+    def _fit_scale_to_screen(img_w, img_h, req_scale=3, screen_frac=0.9):
+        tmp = tk.Tk()
+        try:
+            sw = tmp.winfo_screenwidth()
+            sh = tmp.winfo_screenheight()
+        finally:
+            tmp.destroy()
+        max_w = int(sw * screen_frac)
+        max_h = int(sh * screen_frac)
+        disp_w_req = int(img_w * req_scale)
+        disp_h_req = int(img_h * req_scale)
+        if disp_w_req <= max_w and disp_h_req <= max_h:
+            return req_scale
+        scale_w = max_w / max(1, img_w)
+        scale_h = max_h / max(1, img_h)
+        return max(1.0, min(scale_w, scale_h))
+
+    def _make_scrollable_canvas_with_sidepanel(root, dispW, dispH, pil_img, panel_width=240, title=None):
+        """
+        Crea una grilla 2 columnas: [Canvas con scrollbars] | [Panel de controles].
+        Devuelve (canvas, panel_frame).
+        """
+        if title:
+            root.title(title)
+
+        # Contenedor principal
+        main = tk.Frame(root)
+        main.pack(fill='both', expand=True)
+
+        # --- Columna 0: área de canvas con scroll ---
+        canvas_area = tk.Frame(main)
+        canvas_area.grid(row=0, column=0, sticky='nsew')
+
+        xscroll = tk.Scrollbar(canvas_area, orient='horizontal')
+        yscroll = tk.Scrollbar(canvas_area, orient='vertical')
+
+        vis_w = min(dispW, root.winfo_screenwidth() - panel_width - 80)  # restamos panel y margen
+        vis_h = min(dispH, root.winfo_screenheight() - 140)
+
+        canvas = tk.Canvas(
+            canvas_area,
+            width=vis_w,
+            height=vis_h,
+            scrollregion=(0, 0, dispW, dispH),
+            xscrollcommand=xscroll.set,
+            yscrollcommand=yscroll.set
+        )
+
+        xscroll.config(command=canvas.xview)
+        yscroll.config(command=canvas.yview)
+
+        canvas.grid(row=0, column=0, sticky='nsew')
+        yscroll.grid(row=0, column=1, sticky='ns')
+        xscroll.grid(row=1, column=0, sticky='ew')
+
+        canvas_area.grid_rowconfigure(0, weight=1)
+        canvas_area.grid_columnconfigure(0, weight=1)
+
+        tk_img = ImageTk.PhotoImage(pil_img)
+        canvas.create_image(0, 0, anchor='nw', image=tk_img)
+        canvas.img_ref = tk_img  # evitar GC
+
+        # Scroll con rueda
+        def _on_mousewheel(event):
+            if event.state & 0x0001:  # Shift -> horizontal
+                canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+            else:
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        # --- Columna 1: panel de controles ---
+        panel = tk.Frame(main, width=panel_width, padx=8, pady=8, relief='groove', borderwidth=2)
+        panel.grid(row=0, column=1, sticky='ns')
+        panel.grid_propagate(False)  # mantener ancho fijo
+
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+
+        return canvas, panel
+
+    # ---------- UI (Streamlit) ----------
     mode = st.radio(
         "ROIs a usar:",
         options=["🆕 Nuevos ROIs", "🗂️ Usar ROIs en sesión"],
@@ -321,35 +385,58 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
 
         # ====== Ventana 1: ROI GRANDE ======
         rois_local = []
-        root = tk.Tk(); root.title("Select TRACKING ROIs (large)")
-        dispW, dispH = int(W*scale), int(H*scale)
+        root = tk.Tk()
+        auto_scale = _fit_scale_to_screen(W, H, req_scale=scale, screen_frac=0.9)
+        dispW, dispH = int(W * auto_scale), int(H * auto_scale)
+
         pil_img = Image.fromarray(ui_preview).resize((dispW, dispH), resample=Image.NEAREST)
-        canvas = tk.Canvas(root, width=dispW, height=dispH); canvas.pack()
-        tk_img = ImageTk.PhotoImage(pil_img); canvas.create_image(0, 0, anchor='nw', image=tk_img)
+        canvas, panel = _make_scrollable_canvas_with_sidepanel(
+            root, dispW, dispH, pil_img, panel_width=260, title="Select TRACKING ROIs (large)"
+        )
 
         rect, start = None, (0, 0)
         def on_press(evt):
             nonlocal rect, start
-            start = (evt.x, evt.y)
-            rect = canvas.create_rectangle(evt.x, evt.y, evt.x, evt.y, outline='red', width=2)
+            x = int(canvas.canvasx(evt.x)); y = int(canvas.canvasy(evt.y))
+            start = (x, y)
+            rect = canvas.create_rectangle(x, y, x, y, outline='red', width=2)
+
         def on_drag(evt):
-            canvas.coords(rect, start[0], start[1], evt.x, evt.y)
+            x = int(canvas.canvasx(evt.x)); y = int(canvas.canvasy(evt.y))
+            canvas.coords(rect, start[0], start[1], x, y)
+
         def on_release(evt):
-            x0s, y0s = start; x1s, y1s = evt.x, evt.y
-            xs, ys = min(x0s, x1s), min(y0s, y1s)
-            ws, hs = abs(x1s - x0s), abs(y1s - y0s)
+            x1 = int(canvas.canvasx(evt.x)); y1 = int(canvas.canvasy(evt.y))
+            xs, ys = min(start[0], x1), min(start[1], y1)
+            ws, hs = abs(x1 - start[0]), abs(y1 - start[1])
             if ws > 0 and hs > 0:
                 name = simpledialog.askstring("ROI Name", "Name for this LARGE ROI:", parent=root)
                 if name:
-                    x0 = int(math.floor(xs / scale)); y0 = int(math.floor(ys / scale))
-                    x1 = int(math.ceil((xs + ws) / scale)); y1 = int(math.ceil((ys + hs) / scale))
-                    x0, y0 = max(0,x0), max(0,y0)
-                    x1, y1 = min(W,x1), min(H,y1)
-                    rois_local.append({'name': name, 'rect': (x0, y0, x1 - x0, y1 - y0)})
+                    x0 = int(math.floor(xs / auto_scale)); y0 = int(math.floor(ys / auto_scale))
+                    x2 = int(math.ceil((xs + ws) / auto_scale)); y2 = int(math.ceil((ys + hs) / auto_scale))
+                    x0, y0 = max(0, x0), max(0, y0)
+                    x2, y2 = min(W, x2), min(H, y2)
+                    rois_local.append({'name': name, 'rect': (x0, y0, x2 - x0, y2 - y0)})
+
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_drag)
         canvas.bind('<ButtonRelease-1>', on_release)
-        tk.Button(root, text="Finish Selection (Large ROIs)", command=root.destroy).pack(pady=10)
+
+        # ---- CONTROLES A LA DERECHA (panel) ----
+        lbl_info = tk.Label(panel, text="Controles", font=("TkDefaultFont", 10, "bold"))
+        lbl_info.pack(pady=(0,6), anchor='n')
+
+        tip = ("Arrastra para dibujar ROI grande.\n"
+               "Shift + rueda = scroll horizontal.\n"
+               "Rueda = scroll vertical.")
+        tk.Label(panel, text=tip, justify='left').pack(pady=(0,10), anchor='w')
+
+        tk.Button(panel, text="Finish Selection (Large ROIs)", command=root.destroy).pack(fill='x', pady=6)
+
+        tk.Button(panel, text="Clear Last Rectangle", command=lambda: (
+            canvas.delete(rect) if rect else None
+        )).pack(fill='x', pady=6)
+
         root.mainloop()
 
         if not rois_local:
@@ -368,25 +455,32 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
             if crop.size == 0:
                 continue
 
-            inner_scale = max(MIN_INNER_SCALE, min(MAX_INNER_SCALE, math.ceil(TARGET_MIN_WIDTH / max(1, w))))
+            desired_inner_scale = max(MIN_INNER_SCALE, min(MAX_INNER_SCALE, math.ceil(TARGET_MIN_WIDTH / max(1, w))))
+            inner_scale = _fit_scale_to_screen(w, h, req_scale=desired_inner_scale, screen_frac=0.9)
             dispw = int(w * inner_scale); disph = int(h * inner_scale)
 
             pil_crop = Image.fromarray(crop).resize((dispw, disph), resample=Image.NEAREST)
-            inner_root = tk.Tk(); inner_root.title(f"Small ROIs inside '{name}' (zoom x{inner_scale})")
-            inner_canvas = tk.Canvas(inner_root, width=dispw, height=disph); inner_canvas.pack()
-            inner_tk_img = ImageTk.PhotoImage(pil_crop); inner_canvas.create_image(0, 0, anchor='nw', image=inner_tk_img)
+            inner_root = tk.Tk()
+            inner_canvas, inner_panel = _make_scrollable_canvas_with_sidepanel(
+                inner_root, dispw, disph, pil_crop, panel_width=260,
+                title=f"Small ROIs inside '{name}' (zoom x{inner_scale:.2f})"
+            )
 
             irect, istart = None, (0, 0)
             def i_on_press(evt):
                 nonlocal irect, istart
-                istart = (evt.x, evt.y)
-                irect = inner_canvas.create_rectangle(evt.x, evt.y, evt.x, evt.y, outline='red', width=2)
+                x = int(inner_canvas.canvasx(evt.x)); y = int(inner_canvas.canvasy(evt.y))
+                istart = (x, y)
+                irect = inner_canvas.create_rectangle(x, y, x, y, outline='red', width=2)
+
             def i_on_drag(evt):
-                inner_canvas.coords(irect, istart[0], istart[1], evt.x, evt.y)
+                x = int(inner_canvas.canvasx(evt.x)); y = int(inner_canvas.canvasy(evt.y))
+                inner_canvas.coords(irect, istart[0], istart[1], x, y)
+
             def i_on_release(evt):
-                x0s, y0s = istart; x1s, y1s = evt.x, evt.y
-                xs, ys = min(x0s, x1s), min(y0s, y1s)
-                ws, hs = abs(x1s - x0s), abs(y1s - y0s)
+                x1 = int(inner_canvas.canvasx(evt.x)); y1 = int(inner_canvas.canvasy(evt.y))
+                xs, ys = min(istart[0], x1), min(istart[1], y1)
+                ws, hs = abs(x1 - istart[0]), abs(y1 - istart[1])
                 if ws > 0 and hs > 0:
                     ix0 = int(math.floor(xs / inner_scale)); iy0 = int(math.floor(ys / inner_scale))
                     ix1 = int(math.ceil((xs + ws) / inner_scale));  iy1 = int(math.ceil((ys + hs) / inner_scale))
@@ -395,19 +489,32 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
                     small_name = simpledialog.askstring("Small ROI Name (optional)", "Name:", parent=inner_root)
                     small_name = (small_name.strip() if small_name else None)
                     roi['inners'].append({'name': small_name, 'rect': (ix0, iy0, ix1 - ix0, iy1 - iy0)})
+
             def done():
-                # dedup + clamp antes de cerrar
                 roi['inners'] = _sanitize_inner_rel(_dedup_inner_rects(roi.get('inners', [])), w, h)
                 inner_root.destroy()
-            def clear_last():
-                if roi['inners']: roi['inners'].pop()
+
+            def clear_last_rect():
+                if irect is not None:
+                    inner_canvas.delete(irect)
+
             inner_canvas.bind('<ButtonPress-1>', i_on_press)
             inner_canvas.bind('<B1-Motion>', i_on_drag)
             inner_canvas.bind('<ButtonRelease-1>', i_on_release)
-            btn_box = tk.Frame(inner_root); btn_box.pack(pady=8)
-            tk.Button(btn_box, text="Undo last", command=clear_last).pack(side='left', padx=6)
-            tk.Button(btn_box, text="Done (use these)", command=done).pack(side='left', padx=6)
-            tk.Button(btn_box, text="Skip (none)", command=lambda: (roi['inners'].clear(), done())).pack(side='left', padx=6)
+
+            # ---- CONTROLES A LA DERECHA (panel) ----
+            tk.Label(inner_panel, text=f"Inners in '{name}'", font=("TkDefaultFont", 10, "bold")).pack(pady=(0,6), anchor='n')
+            tip2 = ("Dibuja ROIs pequeños dentro del ROI grande.\n"
+                    "Shift + rueda = scroll horizontal.\n"
+                    "Rueda = scroll vertical.")
+            tk.Label(inner_panel, text=tip2, justify='left').pack(pady=(0,10), anchor='w')
+
+            btn_box = tk.Frame(inner_panel); btn_box.pack(fill='x', pady=8)
+            tk.Button(btn_box, text="Undo last", command=lambda: (roi['inners'].pop() if roi['inners'] else None)).pack(fill='x', pady=4)
+            tk.Button(btn_box, text="Clear last rect drawn", command=clear_last_rect).pack(fill='x', pady=4)
+            tk.Button(btn_box, text="Done (use these)", command=done).pack(fill='x', pady=4)
+            tk.Button(btn_box, text="Skip (none)", command=lambda: (roi['inners'].clear(), done())).pack(fill='x', pady=4)
+
             inner_root.mainloop()
 
     # ---------- Tracking del BIG (por template) ----------
@@ -454,7 +561,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     st.session_state["roi_tracks"] = roi_tracks
     st.session_state["video_file"] = video_path
 
-    # ---------- Guardar/actualizar ROIs en sesión (con templates BIG+INNER) ----------
+    # ---------- Guardar/actualizar ROIs en sesión ----------
     saved_rois_input = []
     for r in roi_tracks:
         _, bx, by, bw, bh = r["coords"][0]
@@ -485,6 +592,7 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
 
     compute_mean_in_tracked_rois(processed_stack, measure_tracks, metadata)
     return roi_tracks
+
 
 
 
