@@ -1,4 +1,4 @@
-import os
+import os, math, base64, json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,10 +11,77 @@ import tkinter as tk
 from tkinter import simpledialog
 import tifffile as tiff
 import glob
+from pathlib import Path
+import os, io
 
 
 default = "/home/alonso/Desktop/"
 st.set_page_config(layout="wide")
+
+def _align_metadata_to_frames(metadata, n_frames):
+    """
+    Devuelve un DataFrame de metadata con una columna 'frame' para poder mergear.
+    Reglas:
+      1) Si existe 'frame' (case-insensitive) -> úsala (convertida a int).
+      2) Si len(metadata)==n_frames -> le creo frame=0..n_frames-1 (alineación posicional).
+      3) Si existe 'Timestamp' y len==n_frames -> también alineación posicional.
+      4) Si nada calza -> devuelve None.
+      dHbO2 / dHb → detectar cambios respecto al basal (activaciones, respuestas a estímulos).
+
+        HbO2 / Hb → tener mapas absolutos estimados en el tiempo (más interpretables clínicamente).
+
+        StO2 → oxigenación instantánea por píxel (0–1); fácil de visualizar y comunicar.
+
+        StO2_mean → una sola señal por tiempo para sincronizar con eventos/estimulación.
+
+        TIFFs → compartir, inspección visual externa, o entrada a otros programas.
+            """
+    if metadata is None:
+        return None
+    if not isinstance(metadata, pd.DataFrame):
+        try:
+            metadata = pd.read_csv(metadata)
+        except Exception:
+            return None
+
+    # Normaliza nombres de columnas
+    cols_norm = {c: c.strip() for c in metadata.columns}
+    metadata = metadata.rename(columns=cols_norm)
+    lower_map = {c.lower(): c for c in metadata.columns}
+
+    # 1) frame explícito
+    if "frame" in lower_map:
+        col = lower_map["frame"]
+        md = metadata.copy()
+        try:
+            md[col] = md[col].astype(int)
+        except Exception:
+            try:
+                md[col] = pd.to_numeric(md[col], errors="coerce").astype("Int64")
+            except Exception:
+                return None
+        md = md.rename(columns={col: "frame"})
+        return md
+
+    # 2) mismo número de filas -> posición
+    if len(metadata) == n_frames:
+        md = metadata.copy()
+        md.insert(0, "frame", np.arange(n_frames, dtype=int))
+        return md
+
+    # 3) Timestamp con misma longitud -> posición
+    ts_col = None
+    for candidate in ["Timestamp", "timestamp", "time_stamp", "TimeStamp"]:
+        if candidate in metadata.columns:
+            ts_col = candidate
+            break
+    if ts_col is not None and len(metadata) == n_frames:
+        md = metadata.copy()
+        md.insert(0, "frame", np.arange(n_frames, dtype=int))
+        return md
+
+    return None
+
 
 # --- Header ---
 def header_agsantos():
@@ -144,20 +211,12 @@ def processed_visualizer(processed_stack, tiff_folder):
             st.caption("Overlay con mismos límites de intensidad")
         return tiff_files
 
-import os, math, cv2, numpy as np, tifffile as tiff
-from PIL import Image, ImageTk
-import tkinter as tk
-from tkinter import simpledialog
-import streamlit as st
+
 
 # Ruta por defecto para el video
 DEFAULT_VIDEO_PATH = default  # <- tu variable/carpeta por defecto
 def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output_video='tracking_output.avi'):
-    import os, math, base64, json
-    import numpy as np, tifffile as tiff, cv2
-    from PIL import Image, ImageTk
-    import tkinter as tk
-    from tkinter import simpledialog
+ 
 
     # Ruta por defecto para el video si no existe la constante externa
     DEFAULT_VIDEO_PATH = os.path.join(os.getcwd(), "videos")
@@ -593,128 +652,81 @@ def tracking_roi_selector(tiff_files, processed_stack, metadata, scale=3, output
     compute_mean_in_tracked_rois(processed_stack, measure_tracks, metadata)
     return roi_tracks
 
-
-
-
-def normalize_img(img, p1=1, p99=99):
-    """Escala imagen a 8-bit con percentiles."""
-    img = img.astype(np.float32)
-    lo, hi = np.percentile(img, (p1, p99))
-    img = np.clip(img, lo, hi)
-    return (255 * (img - lo) / (hi - lo + 1e-5)).astype(np.uint8)
-
-def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None, n_base=50, percent=True):
+def compute_mean_in_tracked_rois(processed_stack, roi_tracks, metadata=None):
     """
-    Calcula la media por ROI y normaliza cada serie con ΔF/F0 usando los primeros n_base frames de ese ROI.
-    - n_base: número de frames iniciales por ROI para F0.
-    - percent: si True, expresa ΔF/F0 en %.
+    Calcula intensidad media por ROI, por frame (sin normalización),
+    y fusiona metadata del CSV por frame si es posible.
+    Exporta CSV combinado.
     """
-    import io
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-
-    height, width = processed_stack.shape[1:]
+    n_frames, height, width = processed_stack.shape
     rows = []
 
-    # --- Recorrer ROIs y armar tabla larga (frame, roi_name, mean_value)
+    # --- Recorrer ROIs y calcular promedio por frame ---
     for roi in roi_tracks:
         name = roi['name']
         for (frame_id, x, y, w, h) in roi['coords']:
             y1, y2 = max(0, y), min(y + h, height)
             x1, x2 = max(0, x), min(x + w, width)
             roi_data = processed_stack[frame_id][y1:y2, x1:x2]
-            mean_val = float(np.nanmean(roi_data)) if roi_data.size > 0 else None
-            if mean_val is not None and np.isnan(mean_val):
-                mean_val = None
-
+            mean_val = float(np.nanmean(roi_data)) if roi_data.size > 0 else np.nan
             rows.append({
                 "frame": int(frame_id),
                 "roi_name": name,
                 "mean_value": mean_val
             })
 
-    # --- DataFrame largo
+    # --- Longitudinal (long) ---
     df_long = pd.DataFrame(rows).dropna(subset=["mean_value"])
     if df_long.empty:
-        st.warning("⚠️ No hay datos para mostrar.")
+        st.warning("⚠️ No hay datos para mostrar (todas las ROIs vacías).")
         return pd.DataFrame()
 
-    # --- Orden por frame para definir F0 correctamente
-    df_long = df_long.sort_values(["roi_name", "frame"])
+    # --- Ancha (wide): frames x ROIs ---
+    df_wide = df_long.pivot(index="frame", columns="roi_name", values="mean_value").reset_index()
 
-    # --- F0 por ROI = media de los primeros n_base valores disponibles
-    f0_map = (
-        df_long.groupby("roi_name")["mean_value"]
-        .apply(lambda s: float(np.nanmean(s.iloc[:n_base])) if len(s) > 0 else np.nan)
-        .to_dict()
-    )
+    # --- Intentar alinear metadata ---
+    md_aligned = _align_metadata_to_frames(metadata, n_frames)
+    if md_aligned is not None:
+        # Evita colisión de nombres; si metadata trae columnas con mismo nombre que una ROI, renómbralas
+        roi_cols = set(df_wide.columns) - {"frame"}
+        rename_map = {}
+        for c in md_aligned.columns:
+            if c != "frame" and c in roi_cols:
+                rename_map[c] = f"meta_{c}"
+        if rename_map:
+            md_aligned = md_aligned.rename(columns=rename_map)
 
-    # --- ΔF/F0 (o %). Si F0==0 o NaN, dejar NaN y avisar.
-    def _norm(row):
-        f0 = f0_map.get(row["roi_name"], np.nan)
-        if f0 is None or np.isnan(f0) or f0 == 0:
-            return np.nan
-        val = (row["mean_value"] - f0) / f0
-        if percent:
-            val *= 100.0
-        return float(val)
-
-    df_long["norm_value"] = df_long.apply(_norm, axis=1)
-
-    # --- Avisos de F0 problemático
-    bad_rois = [r for r, f0 in f0_map.items() if (f0 is None or np.isnan(f0) or f0 == 0)]
-    if bad_rois:
-        st.warning(f"⚠️ F₀ no válido (0 o NaN) en: {', '.join(bad_rois)}. Se omiten en la normalización.")
-
-    # --- Tablas anchas
-    df_wide_raw = df_long.pivot(index="frame", columns="roi_name", values="mean_value").reset_index()
-    df_wide_norm = df_long.pivot(index="frame", columns="roi_name", values="norm_value").reset_index()
-
-    # --- Mostrar tablas
-    st.write("📊 Intensidad media en ROIs (sin normalizar):")
-    st.dataframe(df_wide_raw)
-
-    st.write(f"📊 Normalizado con primeros {n_base} frames por ROI (ΔF/F₀{' %' if percent else ''}):")
-    st.dataframe(df_wide_norm)
-
-    # --- Gráficas
-    if len(df_wide_norm.columns) > 1:
-        st.write("📈 Gráfica normalizada (ΔF/F₀):")
-        st.line_chart(df_wide_norm.set_index("frame"))
+        df_final = df_wide.merge(md_aligned, on="frame", how="left")
+        st.success("✅ Metadata CSV fusionada por frame.")
     else:
-        st.warning("⚠️ No se encontraron ROIs para graficar.")
+        df_final = df_wide
+        st.info("ℹ️ No se pudo alinear metadata: agrega columna 'frame' o usa un CSV con el mismo número de filas que frames.")
 
-    # --- Unir metadata al normalizado (que es lo que probablemente exportarás)
-    df_final = df_wide_norm.copy()
-    if metadata is not None:
-        try:
-            if not isinstance(metadata, pd.DataFrame):
-                metadata = pd.read_csv(metadata)
+    # --- Mostrar tablas y figura ---
+    st.write("📊 **Valores crudos por frame y ROI (sin normalización)**")
+    st.dataframe(df_final)
 
-            if "frame" in metadata.columns:
-                df_final = df_wide_norm.merge(metadata, on="frame", how="left")
-            else:
-                df_final = pd.concat([df_wide_norm, metadata], axis=1)
+    st.write("📈 **Evolución temporal (valores crudos)**")
+    # Para el chart, solo ROIs (evitar columnas de metadata no numéricas)
+    numeric_cols = df_wide.select_dtypes(include=[np.number]).columns.tolist()
+    if "frame" in numeric_cols:
+        numeric_cols.remove("frame")
+    if numeric_cols:
+        st.line_chart(df_wide.set_index("frame")[numeric_cols])
+    else:
+        st.info("No hay columnas numéricas de ROIs para graficar.")
 
-            st.write("📊 Datos normalizados con metadata añadida:")
-            st.dataframe(df_final)
-        except Exception as e:
-            st.error(f"Error leyendo metadata: {e}")
-
-    # --- Descarga
+    # --- Exportar CSV ---
+    import io
     csv_buffer = io.StringIO()
     df_final.to_csv(csv_buffer, index=False)
     st.download_button(
-        label="📥 Descargar resultados normalizados (CSV)",
+        label="📥 Descargar datos crudos + metadata (CSV)",
         data=csv_buffer.getvalue(),
-        file_name="roi_mean_values_normalized.csv",
+        file_name="roi_mean_values_with_metadata.csv",
         mime="text/csv"
     )
 
-    # Para los curiosos: también retorno raw por si luego quieres comparar (ΔF/F₀ no muerde).
-    df_final.attrs["raw"] = df_wide_raw
-    df_final.attrs["f0_map"] = f0_map
     return df_final
 
 

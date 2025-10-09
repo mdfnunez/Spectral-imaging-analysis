@@ -8,13 +8,13 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from tifffile import imwrite
 from numpy.lib.format import open_memmap  
-import os
+import os, json
 
 #Header
 st.set_page_config('Xidec',layout="wide")
 st.title('Xidec')
 st.caption('Software for decompression of .b2nd files from the Xilens program')
-st.caption('The output reflectance_date.npy file has its bands reordered in an ascendent fashion band 0= 460 nm, band 15=594 nm, sensor response and black and white calculations')
+st.caption('Output: reflectance + corrección espectral (virtual bands) según XML; orden ascendente por λ (460→594 nm).')
 
 # Paths (Change paths to local PC if needed)
 global default
@@ -23,43 +23,223 @@ global xml_path #path to xml file
 xml_path="ximea files/CMV2K-SSM4x4-460_600-15.7.20.6.xml"
 #####
 
+
+def load_correction_matrix(xml_path):
+    """
+    Lee del XML la matriz de corrección espectral para REFLECTANCIA (hsi_reflectance).
+    Devuelve:
+      C: np.ndarray (16,16)  -> filas = 'virtual_bands', columnas = canales crudos (orden índice de patrón 0..15)
+      lambda_v: np.ndarray(16,) -> longitudes de onda de las bandas virtuales corregidas (nm)
+    """
+    root = ET.parse(xml_path).getroot()
+    # Busca la matriz correcta por nombre y tipo
+    target = None
+    for cm in root.findall(".//correction_matrix"):
+        name = cm.findtext("name", default="")
+        ctype = cm.findtext("type", default="")
+        if name == "hsi_reflectance" and ctype == "reflectance":
+            target = cm
+            break
+    if target is None:
+        raise RuntimeError("No se encontró 'hsi_reflectance' (type='reflectance') en el XML.")
+
+    C_rows, lambda_v = [], []
+    for vb in target.findall(".//virtual_bands/virtual_band"):
+        wl = float(vb.findtext("wavelength_nm"))
+        lambda_v.append(wl)
+        coeff = vb.find("coefficients")
+        vals = [float(x) for x in coeff.get("values").split()]
+        if len(vals) != 16:
+            raise ValueError("Cada virtual_band debe tener 16 coeficientes.")
+        C_rows.append(vals)
+
+    C = np.asarray(C_rows, dtype=np.float32)       # (16,16)
+    lambda_v = np.asarray(lambda_v, dtype=np.float32)  # (16,)
+    return C, lambda_v
+
+
 def select_file():
     b2nd_file = easygui.fileopenbox('Select .b2nd file', default=default)
-    if b2nd_file is not None:
-        b2nd_loaded = blosc2.open(b2nd_file, mode="r")
-        st.session_state["b2nd_loaded"] = b2nd_loaded
-        st.sidebar.caption(f"Selected file {b2nd_loaded}")
-
-        # White reference
-        b2nd_folder = os.path.dirname(b2nd_file)
-        white_path=os.path.join(b2nd_folder,"white.b2nd")
-        st.session_state['white_path']=white_path
-        if white_path:
-            st.sidebar.caption(st.session_state["white_path"])
-            white_stack = blosc2.open(white_path, mode="r")
-            #Get the median by calculating with 100 frames into single one with median per pixel
-            median_mosaic_white = np.median(white_stack, axis=0)  # (H,W)
-            ### Separate channels 
-            white_per_channel = np.stack(
-                [median_mosaic_white[i::4, j::4] for i in range(4) for j in range(4)],
-                axis=0
-            ).astype(np.float32)  # (16, H/4, W/4)
-            st.session_state["white_median"] = white_per_channel
-
-        # Dark reference
-        dark_path = os.path.join(b2nd_folder,"dark.b2nd")
-        st.session_state["dark_path"]=dark_path
-        if dark_path:
-            st.sidebar.caption(dark_path)
-            dark_stack = blosc2.open(dark_path, mode="r")
-            median_mosaic_dark = np.median(dark_stack, axis=0)  # (H,W)
-            dark_per_channel = np.stack(
-                [median_mosaic_dark[i::4, j::4] for i in range(4) for j in range(4)],
-                axis=0
-            ).astype(np.float32)  # (16, H/4, W/4)
-            st.session_state["dark_median"] = dark_per_channel
-    else:
+    if b2nd_file is None:
         st.session_state["b2nd_loaded"] = None
+        return
+
+    # Cargar medición
+    b2nd_loaded = blosc2.open(b2nd_file, mode="r")
+    loaded_se=st.session_state["b2nd_loaded"] = b2nd_loaded
+    st.sidebar.caption(f"Selected file {loaded_se}")
+    st.session_state["b2nd_filename"]=os.path.basename(b2nd_file)
+    b2nd_folder = os.path.dirname(b2nd_file)
+
+    # --- WHITE ---
+    white_path = os.path.join(b2nd_folder, "white.b2nd")
+    white_se=st.session_state['white_path'] = white_path
+    if os.path.exists(white_path):
+        st.sidebar.caption(white_se)
+        white_stack = blosc2.open(white_path, mode="r")
+        median_white = np.median(white_stack, axis=0)  # (H,W)
+        white_per_channel = np.stack(
+            [median_white[i::4, j::4] for i in range(4) for j in range(4)],
+            axis=0
+        ).astype(np.float32)  # (16, H/4, W/4)
+        st.session_state["white_median"] = white_per_channel
+    else:
+        st.warning("white.b2nd no encontrado en la carpeta.")
+        st.session_state["white_median"] = None
+
+    # --- DARK ---
+    dark_path = os.path.join(b2nd_folder, "dark.b2nd")
+    dark_se=st.session_state["dark_path"] = dark_path
+    if os.path.exists(dark_path):
+        st.sidebar.caption(dark_se)
+        dark_stack = blosc2.open(dark_path, mode="r")
+        median_dark = np.median(dark_stack, axis=0)  # (H,W)
+        dark_per_channel = np.stack(
+            [median_dark[i::4, j::4] for i in range(4) for j in range(4)],
+            axis=0
+        ).astype(np.float32)  # (16, H/4, W/4)
+        st.session_state["dark_median"] = dark_per_channel
+    else:
+        st.warning("dark.b2nd no encontrado.")
+        st.session_state["dark_median"] = None
+
+
+
+def demosaic_and_save(b2nd, dark_img, white_img, xml_path, out_dir,filename):
+    prefix=f"reflectance_{filename}"
+    # 1) Matriz de corrección (reflectancia) y λ virtuales
+    C, lambda_v = load_correction_matrix(xml_path)  # (16,16), (16,)
+
+    # 2) Salida (carpeta con mismo nombre base)
+    N, H, W = len(b2nd), *b2nd[0].shape
+    h4, w4 = H // 4, W // 4
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base_name = f"{prefix}_{ts}"
+    run_dir = os.path.join(out_dir, base_name)
+    os.makedirs(run_dir, exist_ok=True)  # <-- crea la carpeta
+
+    npy_path        = os.path.join(run_dir, f"{base_name}.npy")
+    meta_json_path  = os.path.join(run_dir, f"{base_name}.meta.json")
+    meta_csv_path   = os.path.join(run_dir, f"{base_name}.meta.csv")
+
+    all_refl = open_memmap(npy_path, mode="w+", dtype=np.float32, shape=(N, 16, h4, w4))
+
+    # 3) Validación de shapes
+    if dark_img.shape != (16, h4, w4) or white_img.shape != (16, h4, w4):
+        raise ValueError(f"dark/white shape mismatch. Esperado (16,{h4},{w4}), "
+                         f"dark={dark_img.shape}, white={white_img.shape}")
+
+    bar = st.progress(0.0)
+
+    for i in range(N):
+        raw_frame = b2nd[i]  # (H,W)
+
+        # Demosaic 4x4 → (16,h4,w4) en orden de índice de patrón 0..15
+        bands_16 = np.stack([raw_frame[r::4, c::4] for r in range(4) for c in range(4)], axis=0).astype(np.float32)
+
+        # Reflectancia por píxel
+        with np.errstate(divide='ignore', invalid='ignore'):
+            refl = (bands_16 - dark_img) / (white_img - dark_img + 1e-6)
+
+        # Corrección espectral (virtual bands)
+        corr = np.tensordot(C, refl, axes=(1, 0))  # (16,h4,w4)
+
+        # Limpieza y guardado
+        corr = np.where(np.isfinite(corr), corr, 0.0).astype(np.float32)
+        all_refl[i] = corr
+        bar.progress((i + 1) / N)
+
+    all_refl.flush()
+    st.success(f"Reflectancia corregida guardada en: {npy_path}")
+    st.caption("Bandas virtuales (nm): " + ", ".join(f"{x:.1f}" for x in lambda_v))
+
+    # 4) Metadatos (CSV + JSON) en la misma carpeta
+    df_meta = build_meta_dataframe(b2nd)  # puede ser DataFrame vacío si no hay vlmeta
+    try:
+        if len(df_meta) > 0:
+            df_meta.to_csv(meta_csv_path, index=False)
+    except Exception as e:
+        st.warning(f"No pude guardar CSV de metadatos: {e}")
+
+    static_meta = {
+        "file_data": os.path.basename(npy_path),
+        "shape_data": [int(N), 16, int(h4), int(w4)],
+        "xml_file": os.path.abspath(xml_path),
+        "virtual_wavelengths_nm": [float(x) for x in lambda_v.tolist()],
+        "correction_matrix_rows": 16,
+        "correction_matrix_cols": 16,
+        "dark_path": st.session_state.get("dark_path", None),
+        "white_path": st.session_state.get("white_path", None),
+        "capture_shape_raw": [int(H), int(W)],
+        "note": "Reflectance=(I-dark)/(white-dark); spectral correction: I_corr = C @ I."
+    }
+    # opcional: guardar C completo para reproducibilidad
+    static_meta["correction_matrix_C"] = [[float(v) for v in row] for row in C.tolist()]
+
+    try:
+        with open(meta_json_path, "w", encoding="utf-8") as f:
+            json.dump(static_meta, f, ensure_ascii=False, indent=2)
+        st.info(f"Metadatos guardados:\n- {meta_json_path}\n- {meta_csv_path}")
+    except Exception as e:
+        st.warning(f"No pude guardar JSON de metadatos: {e}")
+
+    # (Opcional) devuelve paths por si quieres enlazar en la UI
+    return {"folder": run_dir, "npy": npy_path, "meta_json": meta_json_path, "meta_csv": meta_csv_path}
+
+
+def build_meta_dataframe(b2nd):
+    """
+    Extrae metadatos de b2nd.vlmeta a un DataFrame estándar (si existen).
+    Columns: Timestamp, Exposure_us, Chip_temperature
+    """
+    # Por si vlmeta no existe o está vacío:
+    if not hasattr(b2nd, "vlmeta") or b2nd.vlmeta is None:
+        return pd.DataFrame([])
+
+    meta = b2nd.vlmeta
+    def get_meta(key, default=None):
+        # keys vienen como bytes, convertimos a str
+        bkey = key if isinstance(key, bytes) else key.encode()
+        val = meta.get(bkey, default)
+        # blosc2 puede devolver arrays tipo bytes; normalizamos a list nativa
+        if val is None:
+            return []
+        if isinstance(val, (bytes, bytearray)):
+            try:
+                # por si son timestamps serializados, NO los decodamos ciegamente
+                return [val.decode()]  # best-effort; si falla, cae al except
+            except Exception:
+                return [str(val)]
+        # numpy → python list
+        try:
+            import numpy as np
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+        except Exception:
+            pass
+        # iterable → list
+        try:
+            return list(val)
+        except TypeError:
+            return [val]
+
+    ts_list   = get_meta("time_stamp", [])
+    exp_list  = get_meta("exposure_us", [])
+    chip_list = get_meta("temperature_chip", [])
+
+    # igualamos longitudes al mínimo común
+    n = min(len(ts_list), len(exp_list), len(chip_list)) if all([ts_list, exp_list, chip_list]) else 0
+    if n == 0:
+        return pd.DataFrame([])
+
+    return pd.DataFrame({
+        "Timestamp": ts_list[:n],
+        "Exposure_us": exp_list[:n],
+        "Chip_temperature": chip_list[:n],
+    })
+
+
+    ### Metadata en
 
 def show_mosaic_frame(b2nd_loaded):
     first_frame=b2nd_loaded[0]
@@ -83,130 +263,7 @@ def mosaic_pattern(b2nd_loaded):
 
     st.pyplot(fig)
     st.caption('Mosaic pattern 4x4, 16 indexes shown in red, the pattern is repeated every 4x4 (rows x columns)')
-
-def meta_data(b2nd):
-        #  Metadata
-    N = len(b2nd)
-    H, W = b2nd[0].shape
-    meta = b2nd.vlmeta
-    #st.write(meta.keys())
-    ###["exposure_us","acq_nframe","color_filter_array","time_stamp","temperature_chip","temperature_house","temperature_house_back_side","temperature_sensor_board"]
-    exposure_meta=meta[b"exposure_us"]
-    time_stamp=meta[b"time_stamp"]
-    temp_chip=meta[b"temperature_chip"]
-    df_meta=pd.DataFrame({"Timestamp":time_stamp,"Exposure":exposure_meta,"Chip temperature":temp_chip})
-    st.session_state["df_meta"]=df_meta
-    st.dataframe(st.session_state.df_meta)
-    csv = st.session_state.df_meta.to_csv(index=False).encode("utf-8")
-    date=datetime.now()
-    st.download_button(
-        label="📥 Download metadata (CSV)",
-        data=csv,
-        file_name=f"metadata_{date}.csv",
-        mime="text/csv"
-    )
-
-    ### Metadata ends
 #Calculations
-
-def demosaic_and_save(b2nd, dark_vec, white_vec):
-    def calibration_data():
-        #XML
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        #Find bands and sort by index
-        bands = root.findall(".//band")
-        bands = sorted(bands, key=lambda b: int(b.get("index", 0)))
-
-        #Get de average response per band
-        resp_means = []
-        for band in bands:
-            values_str = band.find("response").attrib["values"]
-            # Convertir a lista de floats
-            values = [float(v) for v in values_str.split()]
-            # Get average values
-            mean_value = np.mean(values)
-            resp_means.append(mean_value)
-        #Change to float
-        resp_scalar_idx = np.array(resp_means, dtype=np.float32)
-
-        #Show dataframe with scalar average values
-        st.session_state["resp_escalar_idx"]=resp_scalar_idx
-
-        #Get wavelengths from each band
-        wavelengths = []
-        for band in bands:
-            wl_text = band.find("peaks/peak/wavelength_nm").text
-            wl_value = float(wl_text)
-            wavelengths.append(wl_value)
-
-
-        wavelengths_idx = np.array(wavelengths, dtype=np.float32)
-        st.session_state["wavelengths_idx"]=wavelengths_idx
-        
-        ###Dataframe showing physical bands and sensor response
-        dat_resp_wave=pd.DataFrame({"Physical band":range(16),"Average sensor response":st.session_state["resp_escalar_idx"],"Wavelenghts":st.session_state["wavelengths_idx"]})
-        st.session_state["dat_resp_wave"]=dat_resp_wave
-        st.dataframe(st.session_state["dat_resp_wave"],hide_index=True)
-        st.caption('The multispectral camera has 16 physical bands, each defined by an optical filter and sensor sensitivity curve. The wavelength corresponds to the central peak of each filter, while the response scalar represents the average responsivity of the sensor in that band. Raw pixel values are normalized by this response to equalize sensitivity across bands and allow accurate spectral comparison.')
-
-        return resp_scalar_idx,wavelengths_idx,
-
-    resp_scalar_idx, wavelengths_idx = calibration_data()
-    #align for computation
-    resp = resp_scalar_idx[:, None, None].astype(np.float32)  # (16,1,1)
-
-    sort_idx = np.argsort(wavelengths_idx)     
-    #gives the current order of the wavlenghts
-
-        # Datos de ejemplo
-    N, H, W = len(b2nd), *b2nd[0].shape
-
-    # Crear timestamp (ej: 2025-08-31_14-32-10)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-    # Construir path con timestamp
-    out_path = os.path.join(default, f"reflectance_{timestamp}.npy")
-
-    # Crear memmap
-    all_refl = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(N, 16, H//4, W//4))
-
-    #Calculations and progress bar
-    bar = st.progress(0.0)
-
-    for i in range(N):
-        raw_frame = b2nd[i]
-
-        # Demosaic 4x4, 16 bands
-        bands_16 = []
-        for r in range(4):
-            for c in range(4):
-                bands_16.append(raw_frame[r::4, c::4])
-        bands_16 = np.stack(bands_16, axis=0).astype(np.float32)   # (16, H/4, W/4)
-
-        # Radiometric normalization (dark_vec/white_vec shape=(16,1,1))
-        with np.errstate(divide='ignore', invalid='ignore'):
-            norm = (bands_16 - dark_vec) / (white_vec - dark_vec + 1e-6)
-
-        # Correcteed reflectance with sensor resposivity
-        refl_phys = norm / (resp + 1e-12)
-        
-        #Reorganize bands in wavelenghts order
-        to_save = refl_phys if sort_idx is None else refl_phys[sort_idx]
-
-        # Limpieza numérica y escritura directa a disco (memmap)
-        to_save = np.where(np.isfinite(to_save), to_save, 0.0).astype(np.float32)
-        all_refl[i] = to_save
-
-        # Actualiza progreso
-        bar.progress((i + 1) / N)
-
-    # Sincroniza a disco (opcional pero recomendado)
-    all_refl.flush()
-
-    st.success(f"Reflectance calculated and saved in: {default}")
-
-
 
 def front_end():
     # Inicializa claves
@@ -231,6 +288,7 @@ def front_end():
         white_med   = st.session_state.get("white_median")
         dark_med    = st.session_state.get("dark_median")
 
+
         if b2nd_loaded is not None and white_med is not None and dark_med is not None:
 
             st.session_state.b2nd_selected = True
@@ -240,16 +298,15 @@ def front_end():
         else:
             st.sidebar.error("Missing: .b2nd and/or white/dark references")
 
-    # Preview mosaic pattern
     if st.session_state.b2nd_selected:
         b2nd = st.session_state.b2nd_loaded
+        filename=st.session_state.get("b2nd_filename")
+
         with col1:
             show_mosaic_frame(b2nd)
             st.session_state.logs.append("First frame shown")
         with col2:
             mosaic_pattern(b2nd)
-            st.subheader("Metadata")
-            meta_data(b2nd)
 
             st.session_state.logs.append("Mosaic pattern shown")
 
@@ -263,7 +320,7 @@ def front_end():
                     st.error("Faltan datos: carga .b2nd + white + dark.")
                 else:
                     try:
-                        demosaic_and_save(b2nd, dark_vec=dark, white_vec=white)
+                        demosaic_and_save(b2nd, dark, white,xml_path,default,filename)
                     except Exception as e:
                         st.exception(e)
 
