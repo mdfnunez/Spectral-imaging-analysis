@@ -5,6 +5,9 @@ import os, sys, csv
 import numpy as np
 import easygui
 
+# ─────────────────────── Config ───────────────────────
+DEFAULT_DIR = "/home/alonso/Desktop/"   # default para seleccionar .b2nd
+
 # ─────────────────────── Dependencias ───────────────────────
 try:
     import blosc2
@@ -248,8 +251,10 @@ def merge_b2nd_many(paths, out_path, sort_mode="selection", chunk_hw=256):
 # ─────────────────────── Interfaz EasyGUI ───────────────────────
 def main():
     easygui.msgbox("Selecciona ≥2 archivos .b2nd para unir", title="Unir N .b2nd")
+    # default de selección en DEFAULT_DIR
     sel = easygui.fileopenbox("Selecciona .b2nd (Ctrl/Shift para múltiple)",
-                              default="/home/alonso/Desktop/", filetypes=["*.b2nd"], multiple=True)
+                              default=os.path.join(DEFAULT_DIR, "*.b2nd"),
+                              filetypes=["*.b2nd"], multiple=True)
     if not sel:
         return
     if isinstance(sel, str):
@@ -272,7 +277,7 @@ def main():
                  "Ordenar por nombre (A→Z)": "name",
                  "Ordenar por fecha (antiguo→nuevo)": "mtime"}[choice]
 
-    # Confirmación visual
+    # Confirmación visual (previa al orden real)
     listed = sel[:]
     if sort_mode == "name":
         listed = sorted(listed, key=lambda p: os.path.basename(p))
@@ -280,33 +285,22 @@ def main():
         listed = sorted(listed, key=lambda p: os.path.getmtime(p))
     easygui.codebox("Archivos a unir (en orden):", text="\n".join(listed))
 
-    # Ruta de salida
-    outp = easygui.filesavebox("Guardar .b2nd unido como:", default="merged.b2nd", filetypes=["*.b2nd"])
+    # Directorio base para guardar = dir del primer archivo seleccionado
+    base_dir = os.path.dirname(listed[0]) if listed else DEFAULT_DIR
+    default_out = os.path.join(base_dir, "merged.b2nd")
+
+    # Ruta de salida (default en el mismo directorio que los fuentes)
+    outp = easygui.filesavebox("Guardar .b2nd unido como:",
+                               default=default_out, filetypes=["*.b2nd"])
     if not outp:
         return
 
     try:
         shape, dtype, axis, audit = merge_b2nd_many(listed, outp, sort_mode=sort_mode)
-        # Preview opcional
-        try:
-            import imageio.v3 as iio
-            arr = blosc2.open(outp)[:]
-            f0 = arr[0]
-            if f0.dtype == np.uint16:
-                f0 = (f0 >> 8).astype(np.uint8)
-            elif np.issubdtype(f0.dtype, np.floating):
-                f0 = np.clip(f0, 0, 1)
-            png = os.path.splitext(outp)[0] + "_preview.png"
-            iio.imwrite(png, f0)
-        except Exception:
-            png = None
-
         msg = [f"✅ Listo: {outp}",
                f"shape: {shape}   dtype: {dtype}",
                f"axis_concat: {axis}",
                f"Auditoría: {audit}"]
-        if png and os.path.exists(png):
-            msg.append(f"Preview PNG: {png}")
         easygui.msgbox("\n".join(map(str, msg)), "Éxito")
     except Exception as e:
         easygui.exceptionbox(f"Ocurrió un error uniendo los archivos:\n{e}", "Error")
