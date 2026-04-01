@@ -55,6 +55,9 @@ pyparsing==3.2.3
 PyQt5==5.15.11
 PyQt5-Qt5==5.15.17
 PyQt5_sip==12.17.0
+PySide6==6.11.0
+PySide6_Addons==6.11.0
+PySide6_Essentials==6.11.0
 python-dateutil==2.9.0.post0
 pytz==2025.2
 referencing==0.36.2
@@ -64,6 +67,7 @@ ruamel.yaml==0.18.14
 ruamel.yaml.clib==0.2.12
 scikit-image==0.25.2
 scipy==1.15.3
+shiboken6==6.11.0
 six==1.17.0
 smmap==5.0.2
 spglib==2.6.0
